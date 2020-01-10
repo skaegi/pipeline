@@ -84,7 +84,7 @@ var (
 // method, using entrypoint_lookup.go.
 //
 // TODO(#1605): Also use entrypoint injection to order sidecar start/stop.
-func orderContainers(entrypointImage string, steps []corev1.Container) (corev1.Container, []corev1.Container, error) {
+func orderContainers(entrypointImage string, steps []corev1.Container, hasSidecar bool) (corev1.Container, []corev1.Container, error) {
 	toolsInit := corev1.Container{
 		Name:         "place-tools",
 		Image:        entrypointImage,
@@ -100,13 +100,16 @@ func orderContainers(entrypointImage string, steps []corev1.Container) (corev1.C
 		var argsForEntrypoint []string
 		switch i {
 		case 0:
-			argsForEntrypoint = []string{
-				// First step waits for the Downward volume file.
-				"-wait_file", filepath.Join(downwardMountPoint, downwardMountReadyFile),
-				"-wait_file_content", // Wait for file contents, not just an empty file.
-				// Start next step.
-				"-post_file", filepath.Join(mountPoint, fmt.Sprintf("%d", i)),
+			if hasSidecar {
+				// Mount the Downward volume into the first step container.
+				s.VolumeMounts = append(steps[0].VolumeMounts, downwardMount)
+				// If required, first step waits for the Downward volume file
+				argsForEntrypoint = append(argsForEntrypoint, "-wait_file", filepath.Join(downwardMountPoint, downwardMountReadyFile))
+				// Wait for file contents, not just an empty file.
+				argsForEntrypoint = append(argsForEntrypoint, "-wait_file_content")
 			}
+			// Start next step.
+			argsForEntrypoint = append(argsForEntrypoint, "-post_file", filepath.Join(mountPoint, fmt.Sprintf("%d", i)))
 		default:
 			// All other steps wait for previous file, write next file.
 			argsForEntrypoint = []string{
@@ -130,8 +133,6 @@ func orderContainers(entrypointImage string, steps []corev1.Container) (corev1.C
 		steps[i].Args = argsForEntrypoint
 		steps[i].VolumeMounts = append(steps[i].VolumeMounts, toolsMount)
 	}
-	// Mount the Downward volume into the first step container.
-	steps[0].VolumeMounts = append(steps[0].VolumeMounts, downwardMount)
 
 	return toolsInit, steps, nil
 }

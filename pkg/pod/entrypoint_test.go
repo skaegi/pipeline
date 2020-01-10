@@ -79,7 +79,7 @@ func TestOrderContainers(t *testing.T) {
 		},
 		VolumeMounts: []corev1.VolumeMount{toolsMount},
 	}}
-	gotInit, got, err := orderContainers(images.EntrypointImage, steps)
+	gotInit, got, err := orderContainers(images.EntrypointImage, steps, true)
 	if err != nil {
 		t.Fatalf("orderContainers: %v", err)
 	}
