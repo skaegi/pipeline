@@ -172,6 +172,18 @@ func TestExpand(t *testing.T) {
 	}
 }
 
+func TestNullContext(t *testing.T) {
+	t.Run(fmt.Sprintf("null context"), func(t *testing.T) {
+		result, err := Expand(`$$`, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(result, "$") {
+			t.Errorf("TestNullContext() expected $ but was %v (%T).", result, result)
+		}
+	})
+}
+
 // these tests come from https://github.com/kubernetes/kubernetes/blob/master/third_party/forked/golang/expansion/expand_test.go
 func TestContainerEnvMapping(t *testing.T) {
 	context := map[string]string{
