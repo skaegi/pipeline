@@ -1,4 +1,11 @@
 # Tasks
+<!--
+---
+title: "Tasks"
+linkTitle: "Tasks"
+weight: 1
+---
+-->
 
 A `Task` (or a [`ClusterTask`](#clustertask)) is a collection of sequential
 steps you would want to run as part of your continuous integration flow. A task

@@ -1,5 +1,11 @@
 # Authentication
-
+<!--
+---
+title: "Authentication"
+linkTitle: "Authentication"
+weight: 6
+---
+-->
 This document defines how authentication is provided during execution of a
 `TaskRun` or a `PipelineRun` (referred to as `Runs` in this document).
 

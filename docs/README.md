@@ -1,5 +1,13 @@
 # Tekton Pipelines
-
+<!--
+---
+title: "Tasks and Pipelines"
+linkTitle: "Tasks and Pipelines"
+weight: 2
+description: >
+  Building Blocks of Tekton CI/CD Workflow
+---
+-->
 Tekton Pipelines is a Kubernetes extension that installs and runs on your Kubernetes cluster.
 It defines a set of Kubernetes [Custom Resources](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/) that act as building blocks from which you can assemble CI/CD pipelines. Once installed,
 Tekton Pipelines becomes available via the Kubernetes CLI (kubectl) and via API calls, just

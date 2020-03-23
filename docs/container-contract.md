@@ -1,4 +1,11 @@
 # Container Contract
+<!--
+---
+title: "Container Contracts"
+linkTitle: "Container Contracts"
+weight: 7
+---
+-->
 
 Each container image used as a step in a [`Task`](tasks.md) must comply with a
 specific contract.

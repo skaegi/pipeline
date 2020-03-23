@@ -1,4 +1,11 @@
 # PipelineResources
+<!--
+---
+title: "PipelineResources"
+linkTitle: "PipelineResources"
+weight: 5
+---
+-->
 
 `PipelineResources` in a pipeline are the set of objects that are going to be
 used as inputs to a [`Task`](tasks.md) and can be output by a `Task`.

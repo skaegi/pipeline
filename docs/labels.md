@@ -1,4 +1,11 @@
 # Labels
+<!--
+---
+title: "Labels"
+linkTitle: "Labels"
+weight: 9
+---
+-->
 
 In order to make it easier to identify objects that are all part of the same
 conceptual pipeline, custom
@@ -9,9 +16,12 @@ easier to identify relationships between those resources.
 
 ---
 
-- [Propagation Details](#propagation-details)
-- [Automatically Added Labels](#automatically-added-labels)
-- [Examples](#examples)
+- [Labels](#labels)
+  - [Propagation Details](#propagation-details)
+  - [Automatically Added Labels](#automatically-added-labels)
+  - [Examples](#examples)
+    - [Finding Pods for a Specific PipelineRun](#finding-pods-for-a-specific-pipelinerun)
+    - [Finding TaskRuns for a Specific Task](#finding-taskruns-for-a-specific-task)
 
 ---
 
@@ -51,8 +61,12 @@ The following labels are added to resources automatically:
 
 ## Examples
 
-- [Finding Pods for a Specific PipelineRun](#finding-pods-for-a-specific-pipelinerun)
-- [Finding TaskRuns for a Specific Task](#finding-taskruns-for-a-specific-task)
+- [Labels](#labels)
+  - [Propagation Details](#propagation-details)
+  - [Automatically Added Labels](#automatically-added-labels)
+  - [Examples](#examples)
+    - [Finding Pods for a Specific PipelineRun](#finding-pods-for-a-specific-pipelinerun)
+    - [Finding TaskRuns for a Specific Task](#finding-taskruns-for-a-specific-task)
 
 ### Finding Pods for a Specific PipelineRun
 

@@ -1,4 +1,11 @@
 # PodTemplates
+<!--
+---
+title: "Pod Templates"
+linkTitle: "Pod Templates"
+weight: 11
+---
+-->
 
 A pod template specifies a subset of
 [`PodSpec`](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.15/#pod-v1-core)

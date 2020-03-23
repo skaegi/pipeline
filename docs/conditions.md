@@ -1,15 +1,24 @@
 # Conditions
+<!--
+---
+title: "Conditions"
+linkTitle: "Conditions"
+weight: 10
+---
+-->
 
 This document defines `Conditions` and their capabilities.
 
 ---
 
-- [Syntax](#syntax)
-  - [Check](#check)
-  - [Parameters](#parameters)
-  - [Resources](#resources)
-- [Labels](#labels)
-- [Examples](#examples)
+- [Conditions](#conditions)
+  - [Syntax](#syntax)
+    - [Check](#check)
+    - [Description](#description)
+    - [Parameters](#parameters)
+    - [Resources](#resources)
+  - [Labels](#labels)
+  - [Examples](#examples)
 
 ## Syntax
 

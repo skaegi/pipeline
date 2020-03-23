@@ -1,4 +1,11 @@
 # Migrating from [Knative Build](https://github.com/knative/build)
+<!--
+---
+title: "Migration from KNative Build"
+linkTitle: "Migration from KNative Build"
+weight: 12
+---
+-->
 
 This doc describes a process for users who are familiar with Knative `Build` and
 `BuildTemplate` resources to migrate to Tekton `TaskRuns` and `Tasks`, respectively.
