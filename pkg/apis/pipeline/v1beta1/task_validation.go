@@ -18,11 +18,13 @@ package v1beta1
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/tektoncd/pipeline/pkg/apis/validate"
+	"github.com/tektoncd/pipeline/pkg/jsonpath"
 	"github.com/tektoncd/pipeline/pkg/substitution"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -44,6 +46,15 @@ func (ts *TaskSpec) Validate(ctx context.Context) *apis.FieldError {
 	if len(ts.Steps) == 0 {
 		return apis.ErrMissingField("steps")
 	}
+
+	if err := validateExpansion(ts); err != nil {
+		return err
+		// TODO @skaegi
+		// for now we'll just output the err -- to validate the same errors are being returned by the old param validation
+		// The FieldError formatting is different in the validation test cases
+		//fmt.Println(err.Error())
+	}
+
 	if err := ValidateVolumes(ts.Volumes).ViaField("volumes"); err != nil {
 		return err
 	}
@@ -364,4 +375,272 @@ func validateTaskNoArrayReferenced(name, value, prefix string, arrayNames sets.S
 
 func validateTaskArraysIsolated(name, value, prefix string, arrayNames sets.String) *apis.FieldError {
 	return substitution.ValidateVariableIsolated(name, value, prefix, "step", "taskspec.steps", arrayNames)
+}
+
+func validateExpansion(ts *TaskSpec) *apis.FieldError {
+
+	context, apiErr := createTaskContext(ts)
+	if apiErr != nil {
+		return apiErr
+	}
+
+	input, err := toJSONInterfaceType(ts)
+	if err != nil {
+		return apis.ErrGeneric(err.Error(), "spec")
+	}
+
+	_, err = jsonpath.Expand(input, context)
+	if err != nil {
+		return apis.ErrGeneric(err.Error(), "spec")
+	}
+	return nil
+}
+
+func toJSONInterfaceType(v interface{}) (interface{}, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var iJSON interface{}
+	err = json.Unmarshal(b, &iJSON)
+	if err != nil {
+		return nil, err
+	}
+	return iJSON, nil
+
+}
+
+func createTaskContext(ts *TaskSpec) (interface{}, *apis.FieldError) {
+	context := map[string]interface{}{}
+
+	params, err := createParamsContext(ts.Params)
+	if err != nil {
+		return nil, apis.ErrGeneric(err.Error(), "params")
+	}
+	context["params"] = params
+
+	workspaces, err := createWorkspacesContext(ts.Workspaces, params)
+	if err != nil {
+		return nil, apis.ErrGeneric(err.Error(), "workspaces")
+	}
+	context["workspaces"] = workspaces
+
+	resources := map[string]interface{}{}
+
+	if ts.Resources != nil {
+		inputResources, err := createResourcesContext(ts.Resources.Inputs, false, params)
+		if err != nil {
+			return nil, apis.ErrGeneric(err.Error(), "resources.inputs")
+		}
+		resources["inputs"] = inputResources
+
+		outputResources, err := createResourcesContext(ts.Resources.Outputs, true, params)
+		if err != nil {
+			return nil, apis.ErrGeneric(err.Error(), "resources.outputs")
+		}
+		resources["outputs"] = outputResources
+	} else {
+		resources["inputs"] = map[string]interface{}{}
+		resources["outputs"] = map[string]interface{}{}
+	}
+	context["resources"] = resources
+
+	results, err := createResultsContext(ts.Results, params)
+	if err != nil {
+		return nil, apis.ErrGeneric(err.Error(), "results")
+	}
+	context["results"] = results
+
+	//backwards compatability -- inputs and outputs top-levels
+	context["inputs"] = map[string]interface{}{
+		"params":    params,
+		"resources": resources["inputs"],
+	}
+	context["outputs"] = map[string]interface{}{
+		"resources": resources["outputs"],
+	}
+
+	return context, nil
+}
+
+func createParamsContext(tsParams []ParamSpec) (map[string]interface{}, error) {
+	params := map[string]interface{}{}
+	if tsParams == nil {
+		return params, nil
+	}
+	iParams, err := toJSONInterfaceType(tsParams)
+	if err != nil {
+		return nil, err
+	}
+	iParams, err = jsonpath.Expand(iParams, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, p := range iParams.([]interface{}) {
+		param := p.(map[string]interface{})
+		var name = param["name"].(string)
+		var value interface{}
+		if val, ok := param["default"]; ok {
+			value = val
+		} else {
+			switch param["type"] {
+			case "array":
+				value = []interface{}{}
+			default:
+				value = ""
+			}
+		}
+		params[name] = value
+	}
+	return params, nil
+}
+
+func createWorkspacesContext(tsWorkspaces []WorkspaceDeclaration, params interface{}) (map[string]interface{}, error) {
+	workspaces := map[string]interface{}{}
+	if tsWorkspaces == nil {
+		return workspaces, nil
+	}
+
+	iWorkspaces, err := toJSONInterfaceType(tsWorkspaces)
+	if err != nil {
+		return nil, err
+	}
+	iWorkspaces, err = jsonpath.Expand(iWorkspaces, params)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, w := range iWorkspaces.([]interface{}) {
+		workspace := w.(map[string]interface{})
+		var name = workspace["name"].(string)
+		path := "/workspace/" + name
+		if val, ok := workspace["mountPath"]; ok {
+			path = val.(string)
+		}
+		workspaces[name] = map[string]interface{}{
+			"path": path,
+		}
+	}
+	return workspaces, nil
+}
+
+func computeResourcePath(resource map[string]interface{}, isOutput bool) string {
+	if t, ok := resource["targetPath"]; ok && t != "" {
+		targetPath := t.(string)
+		if filepath.IsAbs(targetPath) {
+			return targetPath
+		}
+		return filepath.Join("/workspace", targetPath)
+	}
+	var name = resource["name"].(string)
+	if isOutput {
+		return filepath.Join("/workspace/output", name)
+	}
+	return filepath.Join("/workspace", name)
+
+}
+
+func computeResourceParams(resource map[string]interface{}, isOutput bool) map[string]interface{} {
+	resourceParams := map[string]interface{}{
+		"path": computeResourcePath(resource, isOutput),
+		"name": resource["name"].(string),
+	}
+
+	if t, ok := resource["type"]; ok && t != "" {
+		resourceParams["type"] = t.(string)
+		// var pri v1alpha1.PipelineResourceInterface
+		switch t.(string) {
+		case "git":
+			//pri = &v1alpha1.GitResource{}
+			resourceParams["url"] = ""
+			resourceParams["revision"] = ""
+			resourceParams["depth"] = ""
+			resourceParams["sslVerify"] = ""
+		case "image":
+			//pri = &v1alpha1.ImageResource{}
+			resourceParams["url"] = ""
+			resourceParams["digest"] = ""
+		case "cluster":
+			//pri = &v1alpha1.ClusterResource{}
+			resourceParams["url"] = ""
+			resourceParams["revision"] = ""
+			resourceParams["username"] = ""
+			resourceParams["password"] = ""
+			resourceParams["namespace"] = ""
+			resourceParams["token"] = ""
+			resourceParams["insecure"] = ""
+			resourceParams["cadata"] = ""
+		case "storage":
+			//pri = &v1alpha1.GCSResource{}
+			resourceParams["location"] = ""
+		case "pullrequest":
+			//pri = &v1alpha1.PullRequestResource{}
+			resourceParams["url"] = ""
+			resourceParams["provider"] = ""
+			resourceParams["insecure-skip-tls-verify"] = ""
+		case "cloudevent":
+			//pri = &v1alpha1.CloudEventResource{}
+			resourceParams["target-uri"] = ""
+		}
+		// if pri != nil {
+		// 	for k, v := range pri.Replacements() {
+		// 		resourceParams[k] = v
+		// 	}
+		// }
+	}
+	return resourceParams
+}
+
+func createResourcesContext(tsResources []TaskResource, isOutput bool, params interface{}) (map[string]interface{}, error) {
+	resources := map[string]interface{}{}
+	if tsResources == nil {
+		return resources, nil
+	}
+
+	iResources, err := toJSONInterfaceType(tsResources)
+	if err != nil {
+		return nil, err
+	}
+	iResources, err = jsonpath.Expand(iResources, params)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range iResources.([]interface{}) {
+		resource := r.(map[string]interface{})
+		var name = resource["name"].(string)
+		resources[name] = computeResourceParams(resource, isOutput)
+	}
+
+	return resources, nil
+}
+
+func createResultsContext(tsResults []TaskResult, params interface{}) (map[string]interface{}, error) {
+	results := map[string]interface{}{}
+	if tsResults == nil {
+		return results, nil
+	}
+
+	iResults, err := toJSONInterfaceType(tsResults)
+	if err != nil {
+		return nil, err
+	}
+	iResults, err = jsonpath.Expand(iResults, params)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range iResults.(map[string]interface{}) {
+		result := r.(map[string]interface{})
+		var name = result["name"].(string)
+		path := "/tekton/results/" + name
+		if val, ok := result["path"]; ok {
+			path = val.(string)
+		}
+		results[name] = map[string]interface{}{
+			"path": path,
+		}
+	}
+	return results, nil
 }
