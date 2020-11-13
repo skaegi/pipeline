@@ -32,13 +32,12 @@ import (
 
 var images = pipeline.Images{
 	EntrypointImage:          "override-with-entrypoint:latest",
-	NopImage:                 "tianon/true",
-	AffinityAssistantImage:   "nginx",
+	NopImage:                 "override-with-nop:latest",
 	GitImage:                 "override-with-git:latest",
 	CredsImage:               "override-with-creds:latest",
 	KubeconfigWriterImage:    "override-with-kubeconfig-writer:latest",
 	ShellImage:               "busybox",
-	GsutilImage:              "google/cloud-sdk",
+	GsutilImage:              "gcr.io/google.com/cloudsdktool/cloud-sdk",
 	BuildGCSFetcherImage:     "gcr.io/cloud-builders/gcs-fetcher:latest",
 	PRImage:                  "override-with-pr:latest",
 	ImageDigestExporterImage: "override-with-imagedigest-exporter-image:latest",

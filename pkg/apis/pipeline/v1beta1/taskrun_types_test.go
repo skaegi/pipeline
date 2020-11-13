@@ -17,7 +17,7 @@ limitations under the License.
 package v1beta1_test
 
 import (
-	"fmt"
+	"context"
 	"testing"
 	"time"
 
@@ -172,14 +172,11 @@ func TestTaskRunHasVolumeClaimTemplate(t *testing.T) {
 }
 
 func TestTaskRunKey(t *testing.T) {
-	tr := &v1beta1.TaskRun{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "taskrunname",
-		},
-	}
-	expectedKey := fmt.Sprintf("TaskRun/%p", tr)
-	if tr.GetRunKey() != expectedKey {
-		t.Fatalf("Expected taskrun key to be %s but got %s", expectedKey, tr.GetRunKey())
+	tr := &v1beta1.TaskRun{ObjectMeta: metav1.ObjectMeta{Namespace: "foo", Name: "trunname"}}
+	n := tr.GetNamespacedName()
+	expected := "foo/trunname"
+	if n.String() != expected {
+		t.Fatalf("Expected name to be %s but got %s", expected, n.String())
 	}
 }
 
@@ -333,7 +330,7 @@ func TestHasTimedOut(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := tc.taskRun.HasTimedOut()
+			result := tc.taskRun.HasTimedOut(context.Background())
 			if d := cmp.Diff(result, tc.expectedStatus); d != "" {
 				t.Fatalf(diff.PrintWantGot(d))
 			}

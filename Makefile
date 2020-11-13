@@ -8,8 +8,8 @@ TESTPKGS = $(shell env GO111MODULE=on $(GO) list -f \
 			$(PKGS))
 BIN      = $(CURDIR)/.bin
 
-GOLANGCI_VERSION = v1.28.0
-GOSEC_VERSION    = v2.3.0
+GOLANGCI_VERSION = v1.30.0
+GOSEC_VERSION    = v2.4.0
 
 GO           = go
 TIMEOUT_UNIT = 5m
@@ -20,12 +20,11 @@ M = $(shell printf "\033[34;1m🐱\033[0m")
 
 export GO111MODULE=on
 
+COMMANDS=$(patsubst cmd/%,%,$(wildcard cmd/*))
+BINARIES=$(addprefix bin/,$(COMMANDS))
+
 .PHONY: all
-all: fmt lint | $(BIN) ; $(info $(M) building executable…) @ ## Build program binary
-	$Q $(GO) build \
-		-tags release \
-		-ldflags '-X $(MODULE)/cmd.Version=$(VERSION) -X $(MODULE)/cmd.BuildDate=$(DATE)' \
-		-o $(BIN)/$(basename $(MODULE)) main.go
+all: fmt $(BINARIES) | $(BIN) ; $(info $(M) building executable…) @ ## Build program binary
 
 $(BIN):
 	@mkdir -p $@
@@ -38,7 +37,30 @@ $(BIN)/%: | $(BIN) ; $(info $(M) building $(PACKAGE)…)
 FORCE:
 
 bin/%: cmd/% FORCE
-	$(GO) build -mod=vendor $(LDFLAGS) -v -o $@ ./$<
+	$Q $(GO) build -mod=vendor $(LDFLAGS) -v -o $@ ./$<
+
+.PHONY: cross
+cross: amd64 arm arm64 s390x ppc64le ## build cross platform binaries
+
+.PHONY: amd64
+amd64:
+	GOOS=linux GOARCH=amd64 go build -mod=vendor $(LDFLAGS) ./cmd/...
+
+.PHONY: arm
+arm:
+	GOOS=linux GOARCH=arm go build -mod=vendor $(LDFLAGS) ./cmd/...
+
+.PHONY: arm64
+arm64:
+	GOOS=linux GOARCH=arm64 go build -mod=vendor $(LDFLAGS) ./cmd/...
+
+.PHONY: s390x
+s390x:
+	GOOS=linux GOARCH=s390x go build -mod=vendor $(LDFLAGS) ./cmd/...
+
+.PHONY: ppc64le
+ppc64le:
+	GOOS=linux GOARCH=ppc64le go build -mod=vendor $(LDFLAGS) ./cmd/...
 
 KO = $(BIN)/ko
 $(BIN)/ko: PACKAGE=github.com/google/ko/cmd/ko
@@ -173,6 +195,7 @@ fmt: ; $(info $(M) running gofmt…) @ ## Run gofmt on all source files
 .PHONY: clean
 clean: ; $(info $(M) cleaning…)	@ ## Cleanup everything
 	@rm -rf $(BIN)
+	@rm -rf bin
 	@rm -rf test/tests.* test/coverage.*
 
 .PHONY: help

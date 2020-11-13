@@ -90,6 +90,22 @@ type PipelineResult struct {
 	Value string `json:"value"`
 }
 
+type PipelineTaskMetadata struct {
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+type EmbeddedTask struct {
+	// +optional
+	Metadata PipelineTaskMetadata `json:"metadata,omitempty"`
+
+	// TaskSpec is a specification of a task
+	TaskSpec `json:",inline,omitempty"`
+}
+
 // PipelineTask defines a task in a Pipeline, passing inputs from both
 // Params and from the output of previous tasks.
 type PipelineTask struct {
@@ -104,11 +120,16 @@ type PipelineTask struct {
 
 	// TaskSpec is a specification of a task
 	// +optional
-	TaskSpec *TaskSpec `json:"taskSpec,omitempty"`
+	TaskSpec *EmbeddedTask `json:"taskSpec,omitempty"`
 
 	// Conditions is a list of conditions that need to be true for the task to run
+	// Conditions are deprecated, use WhenExpressions instead
 	// +optional
 	Conditions []PipelineTaskCondition `json:"conditions,omitempty"`
+
+	// WhenExpressions is a list of when expressions that need to be true for the task to run
+	// +optional
+	WhenExpressions WhenExpressions `json:"when,omitempty"`
 
 	// Retries represents how many times this task should be retried in case of task failure: ConditionSucceeded set to False
 	// +optional
@@ -139,29 +160,41 @@ type PipelineTask struct {
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 }
 
+func (pt *PipelineTask) TaskSpecMetadata() PipelineTaskMetadata {
+	return pt.TaskSpec.Metadata
+}
+
 func (pt PipelineTask) HashKey() string {
 	return pt.Name
 }
 
 func (pt PipelineTask) Deps() []string {
 	deps := []string{}
-	deps = append(deps, pt.RunAfter...)
+
+	deps = append(deps, pt.resourceDeps()...)
+	deps = append(deps, pt.orderingDeps()...)
+
+	return deps
+}
+
+func (pt PipelineTask) resourceDeps() []string {
+	resourceDeps := []string{}
 	if pt.Resources != nil {
 		for _, rd := range pt.Resources.Inputs {
-			deps = append(deps, rd.From...)
+			resourceDeps = append(resourceDeps, rd.From...)
 		}
 	}
 	// Add any dependents from conditional resources.
 	for _, cond := range pt.Conditions {
 		for _, rd := range cond.Resources {
-			deps = append(deps, rd.From...)
+			resourceDeps = append(resourceDeps, rd.From...)
 		}
 		for _, param := range cond.Params {
 			expressions, ok := GetVarSubstitutionExpressionsForParam(param)
 			if ok {
 				resultRefs := NewResultRefs(expressions)
 				for _, resultRef := range resultRefs {
-					deps = append(deps, resultRef.PipelineTask)
+					resourceDeps = append(resourceDeps, resultRef.PipelineTask)
 				}
 			}
 		}
@@ -172,11 +205,41 @@ func (pt PipelineTask) Deps() []string {
 		if ok {
 			resultRefs := NewResultRefs(expressions)
 			for _, resultRef := range resultRefs {
-				deps = append(deps, resultRef.PipelineTask)
+				resourceDeps = append(resourceDeps, resultRef.PipelineTask)
 			}
 		}
 	}
-	return deps
+	// Add any dependents from when expressions
+	for _, whenExpression := range pt.WhenExpressions {
+		expressions, ok := whenExpression.GetVarSubstitutionExpressions()
+		if ok {
+			resultRefs := NewResultRefs(expressions)
+			for _, resultRef := range resultRefs {
+				resourceDeps = append(resourceDeps, resultRef.PipelineTask)
+			}
+		}
+	}
+	return resourceDeps
+}
+
+func (pt PipelineTask) orderingDeps() []string {
+	orderingDeps := []string{}
+	resourceDeps := pt.resourceDeps()
+	for _, runAfter := range pt.RunAfter {
+		if !contains(runAfter, resourceDeps) {
+			orderingDeps = append(orderingDeps, runAfter)
+		}
+	}
+	return orderingDeps
+}
+
+func contains(s string, arr []string) bool {
+	for _, elem := range arr {
+		if elem == s {
+			return true
+		}
+	}
+	return false
 }
 
 type PipelineTaskList []PipelineTask

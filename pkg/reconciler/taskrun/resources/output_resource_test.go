@@ -17,14 +17,14 @@ limitations under the License.
 package resources
 
 import (
+	"context"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/tektoncd/pipeline/pkg/apis/config"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"github.com/tektoncd/pipeline/pkg/apis/resource"
 	resourcev1alpha1 "github.com/tektoncd/pipeline/pkg/apis/resource/v1alpha1"
-	"github.com/tektoncd/pipeline/pkg/artifacts"
-	"github.com/tektoncd/pipeline/pkg/logging"
 	"github.com/tektoncd/pipeline/test/diff"
 	"github.com/tektoncd/pipeline/test/names"
 	corev1 "k8s.io/api/core/v1"
@@ -37,7 +37,6 @@ var (
 )
 
 func outputTestResourceSetup() {
-	logger, _ = logging.NewLogger("", "")
 
 	rs := []*resourcev1alpha1.PipelineResource{{
 		ObjectMeta: metav1.ObjectMeta{
@@ -487,7 +486,7 @@ func TestValidOutputResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:  "upload-source-gcs-78c5n",
-				Image: "google/cloud-sdk",
+				Image: "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				VolumeMounts: []corev1.VolumeMount{{
 					Name:      "volume-source-gcs-sname",
 					MountPath: "/var/secret/sname",
@@ -577,7 +576,7 @@ func TestValidOutputResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:  "upload-source-gcs-78c5n",
-				Image: "google/cloud-sdk",
+				Image: "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				VolumeMounts: []corev1.VolumeMount{{
 					Name: "volume-source-gcs-sname", MountPath: "/var/secret/sname",
 				}},
@@ -648,7 +647,7 @@ func TestValidOutputResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:  "upload-source-gcs-mz4c7",
-				Image: "google/cloud-sdk",
+				Image: "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				VolumeMounts: []corev1.VolumeMount{{
 					Name: "volume-source-gcs-sname", MountPath: "/var/secret/sname",
 				}},
@@ -709,7 +708,7 @@ func TestValidOutputResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:  "upload-source-gcs-mz4c7",
-				Image: "google/cloud-sdk",
+				Image: "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				VolumeMounts: []corev1.VolumeMount{{
 					Name: "volume-source-gcs-sname", MountPath: "/var/secret/sname",
 				}},
@@ -917,7 +916,7 @@ func TestValidOutputResources(t *testing.T) {
 			names.TestingSeed()
 			outputTestResourceSetup()
 			fakekubeclient := fakek8s.NewSimpleClientset()
-			got, err := AddOutputResources(fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, resolveOutputResources(c.taskRun), logger)
+			got, err := AddOutputResources(context.Background(), fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, resolveOutputResources(c.taskRun))
 			if err != nil {
 				t.Fatalf("Failed to declare output resources for test name %q ; test description %q: error %v", c.name, c.desc, err)
 			}
@@ -1001,7 +1000,7 @@ func TestValidOutputResourcesWithBucketStorage(t *testing.T) {
 			Command: []string{"mkdir", "-p", "/workspace/output/source-workspace"},
 		}}, {Container: corev1.Container{
 			Name:    "artifact-copy-to-source-git-mz4c7",
-			Image:   "google/cloud-sdk",
+			Image:   "gcr.io/google.com/cloudsdktool/cloud-sdk",
 			Command: []string{"gsutil"},
 			Args:    []string{"cp", "-P", "-r", "/workspace/output/source-workspace", "gs://fake-bucket/pipeline-task-name"},
 		}}},
@@ -1052,7 +1051,7 @@ func TestValidOutputResourcesWithBucketStorage(t *testing.T) {
 			Command: []string{"mkdir", "-p", "/workspace/output/source-workspace"},
 		}}, {Container: corev1.Container{
 			Name:    "artifact-copy-to-source-git-mz4c7",
-			Image:   "google/cloud-sdk",
+			Image:   "gcr.io/google.com/cloudsdktool/cloud-sdk",
 			Command: []string{"gsutil"},
 			Args:    []string{"cp", "-P", "-r", "/workspace/output/source-workspace", "gs://fake-bucket/pipeline-task-name"},
 		}}},
@@ -1101,18 +1100,18 @@ func TestValidOutputResourcesWithBucketStorage(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			outputTestResourceSetup()
 			names.TestingSeed()
-			fakekubeclient := fakek8s.NewSimpleClientset(
-				&corev1.ConfigMap{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: "tekton-pipelines",
-						Name:      artifacts.GetBucketConfigName(),
-					},
-					Data: map[string]string{
-						artifacts.BucketLocationKey: "gs://fake-bucket",
-					},
-				},
-			)
-			got, err := AddOutputResources(fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, resolveOutputResources(c.taskRun), logger)
+			fakekubeclient := fakek8s.NewSimpleClientset()
+			bucketConfig, err := config.NewArtifactBucketFromMap(map[string]string{
+				config.BucketLocationKey: "gs://fake-bucket",
+			})
+			if err != nil {
+				t.Fatalf("Test: %q; Error setting up bucket config = %v", c.desc, err)
+			}
+			configs := config.Config{
+				ArtifactBucket: bucketConfig,
+			}
+			ctx := config.ToContext(context.Background(), &configs)
+			got, err := AddOutputResources(ctx, fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, resolveOutputResources(c.taskRun))
 			if err != nil {
 				t.Fatalf("Failed to declare output resources for test name %q ; test description %q: error %v", c.name, c.desc, err)
 			}
@@ -1316,7 +1315,7 @@ func TestInvalidOutputResources(t *testing.T) {
 		t.Run(c.desc, func(t *testing.T) {
 			outputTestResourceSetup()
 			fakekubeclient := fakek8s.NewSimpleClientset()
-			_, err := AddOutputResources(fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, resolveOutputResources(c.taskRun), logger)
+			_, err := AddOutputResources(context.Background(), fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, resolveOutputResources(c.taskRun))
 			if (err != nil) != c.wantErr {
 				t.Fatalf("Test AddOutputResourceSteps %v : error%v", c.desc, err)
 			}
@@ -1449,7 +1448,7 @@ func TestInputOutputBucketResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:    "artifact-copy-from-source-workspace-mz4c7",
-				Image:   "google/cloud-sdk",
+				Image:   "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				Command: []string{"gsutil"},
 				Args: []string{
 					"cp",
@@ -1468,7 +1467,7 @@ func TestInputOutputBucketResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:         "upload-source-gcs-bucket-78c5n",
-				Image:        "google/cloud-sdk",
+				Image:        "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				VolumeMounts: nil,
 				Command:      []string{"gsutil"},
 				Args:         []string{"rsync", "-d", "-r", "/workspace/output/source-workspace", "gs://some-bucket"},
@@ -1563,7 +1562,7 @@ func TestInputOutputBucketResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:    "artifact-copy-from-source-workspace-78c5n",
-				Image:   "google/cloud-sdk",
+				Image:   "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				Command: []string{"gsutil"},
 				Args: []string{
 					"cp",
@@ -1589,7 +1588,7 @@ func TestInputOutputBucketResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:    "artifact-copy-from-source-workspace-2-mz4c7",
-				Image:   "google/cloud-sdk",
+				Image:   "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				Command: []string{"gsutil"},
 				Args:    []string{"cp", "-P", "-r", "gs://fake-bucket/pipeline-task-path-2/*", "/workspace/faraway-disk-2"},
 				Env: []corev1.EnvVar{
@@ -1601,7 +1600,7 @@ func TestInputOutputBucketResources(t *testing.T) {
 				VolumeMounts: []corev1.VolumeMount{{Name: "volume-bucket-sname", MountPath: "/var/bucketsecret/sname"}},
 			}}, {Container: corev1.Container{
 				Name:    "upload-source-gcs-bucket-3-j2tds",
-				Image:   "google/cloud-sdk",
+				Image:   "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				Command: []string{"gsutil"},
 				Args:    []string{"rsync", "-d", "-r", "/workspace/output/source-workspace-3", "gs://some-bucket-3"},
 			}},
@@ -1678,7 +1677,7 @@ func TestInputOutputBucketResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:    "upload-source-gcs-bucket-mz4c7",
-				Image:   "google/cloud-sdk",
+				Image:   "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				Command: []string{"gsutil"},
 				Args: []string{
 					"rsync",
@@ -1690,7 +1689,7 @@ func TestInputOutputBucketResources(t *testing.T) {
 			}},
 			{Container: corev1.Container{
 				Name:         "upload-source-gcs-bucket-2-78c5n",
-				Image:        "google/cloud-sdk",
+				Image:        "gcr.io/google.com/cloudsdktool/cloud-sdk",
 				VolumeMounts: nil,
 				Command:      []string{"gsutil"},
 				Args:         []string{"rsync", "-d", "-r", "/workspace/output/source-workspace-2", "gs://some-bucket-2"},
@@ -1707,27 +1706,26 @@ func TestInputOutputBucketResources(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			names.TestingSeed()
 			outputTestResourceSetup()
-			fakekubeclient := fakek8s.NewSimpleClientset(
-				&corev1.ConfigMap{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: "tekton-pipelines",
-						Name:      artifacts.GetBucketConfigName(),
-					},
-					Data: map[string]string{
-						artifacts.BucketLocationKey:              "gs://fake-bucket",
-						artifacts.BucketServiceAccountSecretName: "sname",
-						artifacts.BucketServiceAccountSecretKey:  "key.json",
-					},
-				},
-			)
-
+			fakekubeclient := fakek8s.NewSimpleClientset()
+			bucketConfig, err := config.NewArtifactBucketFromMap(map[string]string{
+				config.BucketLocationKey:                 "gs://fake-bucket",
+				config.BucketServiceAccountSecretNameKey: "sname",
+				config.BucketServiceAccountSecretKeyKey:  "key.json",
+			})
+			if err != nil {
+				t.Fatalf("Test: %q; Error setting up bucket config = %v", c.desc, err)
+			}
+			configs := config.Config{
+				ArtifactBucket: bucketConfig,
+			}
+			ctx := config.ToContext(context.Background(), &configs)
 			inputs := resolveInputResources(c.taskRun)
-			ts, err := AddInputResource(fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, inputs, logger)
+			ts, err := AddInputResource(ctx, fakekubeclient, images, c.task.Name, &c.task.Spec, c.taskRun, inputs)
 			if err != nil {
 				t.Fatalf("Failed to declare input resources for test name %q ; test description %q: error %v", c.name, c.desc, err)
 			}
 
-			got, err := AddOutputResources(fakekubeclient, images, c.task.Name, ts, c.taskRun, resolveOutputResources(c.taskRun), logger)
+			got, err := AddOutputResources(ctx, fakekubeclient, images, c.task.Name, ts, c.taskRun, resolveOutputResources(c.taskRun))
 			if err != nil {
 				t.Fatalf("Failed to declare output resources for test name %q ; test description %q: error %v", c.name, c.desc, err)
 			}

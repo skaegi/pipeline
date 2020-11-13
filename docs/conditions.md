@@ -6,6 +6,8 @@ weight: 11
 -->
 # Conditions
 
+**Note:** `Conditions` are deprecated, use [WhenExpressions](pipelines.md#guard-task-execution-using-whenexpressions) instead. 
+
 - [Overview](#overview)
 - [Configuring a `Condition`](#configuring-a-condition)
   - [Specifying the condition `check`](#specifying-the-condition-check)
@@ -78,7 +80,7 @@ branch name doesn't collide with any of the specified protected branch names.
 
 ### Specifying `Resources`
 
-You can specifiy input [`PipelineResources`](resources.md) in your `Condition` definition to 
+You can specify input [`PipelineResources`](resources.md) in your `Condition` definition to 
 provide the `Condition's` container step with data or context necessary to run the evaluation logic.
 
 `Resources` in `Conditions` behave the same way as in `Tasks`:

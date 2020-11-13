@@ -19,6 +19,8 @@ package pipelinerun
 import (
 	"context"
 	"fmt"
+	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -26,12 +28,15 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/go-containerregistry/pkg/registry"
 	tbv1alpha1 "github.com/tektoncd/pipeline/internal/builder/v1alpha1"
 	tb "github.com/tektoncd/pipeline/internal/builder/v1beta1"
+	"github.com/tektoncd/pipeline/pkg/apis/config"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	resourcev1alpha1 "github.com/tektoncd/pipeline/pkg/apis/resource/v1alpha1"
+	"github.com/tektoncd/pipeline/pkg/reconciler/events/cloudevent"
 	"github.com/tektoncd/pipeline/pkg/reconciler/pipelinerun/resources"
 	taskrunresources "github.com/tektoncd/pipeline/pkg/reconciler/taskrun/resources"
 	ttesting "github.com/tektoncd/pipeline/pkg/reconciler/testing"
@@ -45,8 +50,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
-	k8stesting "k8s.io/client-go/testing"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"knative.dev/pkg/apis"
@@ -54,6 +59,7 @@ import (
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
+	logtesting "knative.dev/pkg/logging/testing"
 	"knative.dev/pkg/reconciler"
 )
 
@@ -62,23 +68,68 @@ var (
 	ignoreLastTransitionTime = cmpopts.IgnoreTypes(apis.Condition{}.LastTransitionTime.Inner.Time)
 	images                   = pipeline.Images{
 		EntrypointImage:          "override-with-entrypoint:latest",
-		NopImage:                 "tianon/true",
-		AffinityAssistantImage:   "nginx",
+		NopImage:                 "override-with-nop:latest",
 		GitImage:                 "override-with-git:latest",
 		CredsImage:               "override-with-creds:latest",
 		KubeconfigWriterImage:    "override-with-kubeconfig-writer:latest",
 		ShellImage:               "busybox",
-		GsutilImage:              "google/cloud-sdk",
+		GsutilImage:              "gcr.io/google.com/cloudsdktool/cloud-sdk",
 		BuildGCSFetcherImage:     "gcr.io/cloud-builders/gcs-fetcher:latest",
 		PRImage:                  "override-with-pr:latest",
 		ImageDigestExporterImage: "override-with-imagedigest-exporter-image:latest",
 	}
 
 	ignoreResourceVersion = cmpopts.IgnoreFields(metav1.ObjectMeta{}, "ResourceVersion")
+	trueb                 = true
 )
 
-func getRunName(pr *v1beta1.PipelineRun) string {
-	return strings.Join([]string{pr.Namespace, pr.Name}, "/")
+type PipelineRunTest struct {
+	test.Data  `json:"inline"`
+	Test       *testing.T
+	TestAssets test.Assets
+	Cancel     func()
+}
+
+func ensureConfigurationConfigMapsExist(d *test.Data) {
+	var defaultsExists, featureFlagsExists, artifactBucketExists, artifactPVCExists bool
+	for _, cm := range d.ConfigMaps {
+		if cm.Name == config.GetDefaultsConfigName() {
+			defaultsExists = true
+		}
+		if cm.Name == config.GetFeatureFlagsConfigName() {
+			featureFlagsExists = true
+		}
+		if cm.Name == config.GetArtifactBucketConfigName() {
+			artifactBucketExists = true
+		}
+		if cm.Name == config.GetArtifactPVCConfigName() {
+			artifactPVCExists = true
+		}
+	}
+	if !defaultsExists {
+		d.ConfigMaps = append(d.ConfigMaps, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetDefaultsConfigName(), Namespace: system.GetNamespace()},
+			Data:       map[string]string{},
+		})
+	}
+	if !featureFlagsExists {
+		d.ConfigMaps = append(d.ConfigMaps, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetFeatureFlagsConfigName(), Namespace: system.GetNamespace()},
+			Data:       map[string]string{},
+		})
+	}
+	if !artifactBucketExists {
+		d.ConfigMaps = append(d.ConfigMaps, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetArtifactBucketConfigName(), Namespace: system.GetNamespace()},
+			Data:       map[string]string{},
+		})
+	}
+	if !artifactPVCExists {
+		d.ConfigMaps = append(d.ConfigMaps, &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetArtifactPVCConfigName(), Namespace: system.GetNamespace()},
+			Data:       map[string]string{},
+		})
+	}
 }
 
 // getPipelineRunController returns an instance of the PipelineRun controller/reconciler that has been seeded with
@@ -87,6 +138,7 @@ func getPipelineRunController(t *testing.T, d test.Data) (test.Assets, func()) {
 	//unregisterMetrics()
 	ctx, _ := ttesting.SetupFakeContext(t)
 	ctx, cancel := context.WithCancel(ctx)
+	ensureConfigurationConfigMapsExist(&d)
 	c, informers := test.SeedTestData(t, ctx, d)
 	configMapWatcher := configmap.NewInformedWatcher(c.Kube, system.GetNamespace())
 
@@ -95,6 +147,9 @@ func getPipelineRunController(t *testing.T, d test.Data) (test.Assets, func()) {
 	if la, ok := ctl.Reconciler.(reconciler.LeaderAware); ok {
 		la.Promote(reconciler.UniversalBucket(), func(reconciler.Bucket, types.NamespacedName) {})
 	}
+	if err := configMapWatcher.Start(ctx.Done()); err != nil {
+		t.Fatalf("error starting configmap watcher: %v", err)
+	}
 
 	return test.Assets{
 		Logger:     logging.FromContext(ctx),
@@ -102,6 +157,7 @@ func getPipelineRunController(t *testing.T, d test.Data) (test.Assets, func()) {
 		Clients:    c,
 		Informers:  informers,
 		Recorder:   controller.GetEventRecorder(ctx).(*record.FakeRecorder),
+		Ctx:        ctx,
 	}, cancel
 }
 
@@ -114,6 +170,11 @@ func conditionCheckFromTaskRun(tr *v1beta1.TaskRun) *v1beta1.ConditionCheck {
 func checkEvents(t *testing.T, fr *record.FakeRecorder, testName string, wantEvents []string) error {
 	t.Helper()
 	return eventFromChannel(fr.Events, testName, wantEvents)
+}
+
+func checkCloudEvents(t *testing.T, fce *cloudevent.FakeClient, testName string, wantEvents []string) error {
+	t.Helper()
+	return eventFromChannel(fce.Events, testName, wantEvents)
 }
 
 func eventFromChannel(c chan string, testName string, wantEvents []string) error {
@@ -149,6 +210,47 @@ func eventFromChannel(c chan string, testName string, wantEvents []string) error
 			}
 		}
 	}
+	return nil
+}
+
+// getTaskRunCreations will look through a set of actions to find all task run creation actions and return the set of
+// them. It will fatal the test if none are found.
+func getTaskRunCreations(t *testing.T, actions []ktesting.Action) []*v1beta1.TaskRun {
+	t.Helper()
+	outputs := []*v1beta1.TaskRun{}
+	for _, a := range actions {
+		if action, ok := a.(ktesting.CreateAction); ok {
+			if output, ok := action.GetObject().(*v1beta1.TaskRun); ok {
+				outputs = append(outputs, output)
+			}
+		}
+	}
+
+	if len(outputs) > 0 {
+		return outputs
+	}
+	t.Log("actions", actions)
+	t.Fatal("failed to find an action that created a taskrun")
+	return nil
+}
+
+// getPipelineRunUpdates will look through a set of actions to find all PipelineRun creation actions and return the
+// set of them. It will fatal the test if none are found.
+func getPipelineRunUpdates(t *testing.T, actions []ktesting.Action) []*v1beta1.PipelineRun {
+	t.Helper()
+	outputs := []*v1beta1.PipelineRun{}
+	for _, a := range actions {
+		if action, ok := a.(ktesting.UpdateAction); ok {
+			if output, ok := action.GetObject().(*v1beta1.PipelineRun); ok {
+				outputs = append(outputs, output)
+			}
+		}
+	}
+
+	if len(outputs) > 0 {
+		return outputs
+	}
+	t.Fatal("failed to find an action that updated a pipelinerun")
 	return nil
 }
 
@@ -268,30 +370,22 @@ func TestReconcile(t *testing.T) {
 		ClusterTasks:      clusterTasks,
 		PipelineResources: rs,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	if err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-success"); err != nil {
-		t.Fatalf("Error reconciling: %s", err)
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 0",
 	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-success", wantEvents, false)
 
-	if len(clients.Pipeline.Actions()) == 0 {
-		t.Fatalf("Expected client to have been used to create a TaskRun but it wasn't")
-	}
-
-	t.Log("actions", clients.Pipeline.Actions())
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-success", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
+	actions := clients.Pipeline.Actions()
+	if len(actions) < 2 {
+		t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 	}
 
 	// Check that the expected TaskRun was created
-	actual := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject()
+	actual := getTaskRunCreations(t, actions)[0]
 	expectedTaskRun := tb.TaskRun("test-pipeline-run-success-unit-test-1-mz4c7",
 		tb.TaskRunNamespace("foo"),
 		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run-success",
@@ -359,16 +453,7 @@ func TestReconcile(t *testing.T) {
 	}
 
 	// A PVC should have been created to deal with output -> input linking
-	ensurePVCCreated(t, clients, expectedTaskRun.GetPipelineRunPVCName(), "foo")
-
-	wantEvents := []string{
-		"Normal Started",
-		"Normal Running Tasks Completed: 0",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-success", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
-	}
+	ensurePVCCreated(prt.TestAssets.Ctx, t, clients, expectedTaskRun.GetPipelineRunPVCName(), "foo")
 }
 
 func TestReconcile_PipelineSpecTaskSpec(t *testing.T) {
@@ -386,7 +471,7 @@ func TestReconcile_PipelineSpecTaskSpec(t *testing.T) {
 		tb.Pipeline("test-pipeline",
 			tb.PipelineNamespace("foo"),
 			tb.PipelineSpec(
-				tb.PipelineTask("unit-test-task-spec", "", tb.PipelineTaskSpec(&v1beta1.TaskSpec{
+				tb.PipelineTask("unit-test-task-spec", "", tb.PipelineTaskSpec(v1beta1.TaskSpec{
 					Steps: []v1beta1.Step{{Container: corev1.Container{
 						Name:  "mystep",
 						Image: "myimage"}}},
@@ -396,36 +481,25 @@ func TestReconcile_PipelineSpecTaskSpec(t *testing.T) {
 	}
 
 	d := test.Data{
-		PipelineRuns:      prs,
-		Pipelines:         ps,
-		Tasks:             nil,
-		ClusterTasks:      nil,
-		PipelineResources: nil,
+		PipelineRuns: prs,
+		Pipelines:    ps,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	if err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-success"); err != nil {
-		t.Fatalf("Error reconciling: %s", err)
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 0",
 	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-success", wantEvents, false)
 
-	if len(clients.Pipeline.Actions()) == 0 {
-		t.Fatalf("Expected client to have been used to create a TaskRun but it wasn't")
-	}
-
-	t.Log("actions", clients.Pipeline.Actions())
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-success", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
+	actions := clients.Pipeline.Actions()
+	if len(actions) < 2 {
+		t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 	}
 
 	// Check that the expected TaskRun was created
-	actual := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject()
+	actual := getTaskRunCreations(t, actions)[0]
 	expectedTaskRun := tb.TaskRun("test-pipeline-run-success-unit-test-task-spec-9l9zj",
 		tb.TaskRunNamespace("foo"),
 		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run-success",
@@ -435,7 +509,8 @@ func TestReconcile_PipelineSpecTaskSpec(t *testing.T) {
 		tb.TaskRunLabel("tekton.dev/pipeline", "test-pipeline"),
 		tb.TaskRunLabel("tekton.dev/pipelineRun", "test-pipeline-run-success"),
 		tb.TaskRunLabel(pipeline.GroupName+pipeline.PipelineTaskLabelKey, "unit-test-task-spec"),
-		tb.TaskRunSpec(tb.TaskRunTaskSpec(tb.Step("myimage", tb.StepName("mystep")))),
+		tb.TaskRunSpec(tb.TaskRunTaskSpec(tb.Step("myimage", tb.StepName("mystep"))),
+			tb.TaskRunServiceAccountName(config.DefaultServiceAccountValue)),
 	)
 
 	// ignore IgnoreUnexported ignore both after and before steps fields
@@ -455,22 +530,11 @@ func TestReconcile_PipelineSpecTaskSpec(t *testing.T) {
 	if _, exists := reconciledRun.Status.TaskRuns["test-pipeline-run-success-unit-test-task-spec-9l9zj"]; !exists {
 		t.Errorf("Expected PipelineRun status to include TaskRun status but was %v", reconciledRun.Status.TaskRuns)
 	}
-
-	wantEvents := []string{
-		"Normal Started",
-		"Normal Running Tasks Completed: 0",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-success", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
-	}
 }
 
 // TestReconcile_InvalidPipelineRuns runs "Reconcile" on several PipelineRuns that are invalid in different ways.
 // It verifies that reconcile fails, how it fails and which events are triggered.
 func TestReconcile_InvalidPipelineRuns(t *testing.T) {
-	// TestReconcile_InvalidPipelineRuns runs "Reconcile" on several PipelineRuns that are invalid in different ways.
-	// It verifies that reconcile fails, how it fails and which events are triggered.
 	ts := []*v1beta1.Task{
 		tb.Task("a-task-that-exists", tb.TaskNamespace("foo")),
 		tb.Task("a-task-that-needs-params", tb.TaskSpec(
@@ -501,204 +565,171 @@ func TestReconcile_InvalidPipelineRuns(t *testing.T) {
 			tb.PipelineTask("some-task", "a-task-that-needs-array-params"))),
 		tb.Pipeline("a-pipeline-with-missing-conditions", tb.PipelineNamespace("foo"), tb.PipelineSpec(tb.PipelineTask("some-task", "a-task-that-exists", tb.PipelineTaskCondition("condition-does-not-exist")))),
 	}
-	prs := []*v1beta1.PipelineRun{
-		tb.PipelineRun("invalid-pipeline", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("pipeline-not-exist")),
-		tb.PipelineRun("pipelinerun-missing-tasks", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("pipeline-missing-tasks")),
-		tb.PipelineRun("pipeline-params-dont-exist", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-without-params")),
-		tb.PipelineRun("pipeline-resources-not-bound", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-fine-pipeline")),
-		tb.PipelineRun("pipeline-resources-dont-exist", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-fine-pipeline",
-			tb.PipelineRunResourceBinding("a-resource", tb.PipelineResourceBindingRef("missing-resource")))),
-		tb.PipelineRun("pipeline-resources-not-declared", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-that-should-be-caught-by-admission-control")),
-		tb.PipelineRun("pipeline-mismatching-param-type", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-with-array-params", tb.PipelineRunParam("some-param", "stringval"))),
-		tb.PipelineRun("pipeline-conditions-missing", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-with-missing-conditions")),
-		tb.PipelineRun("embedded-pipeline-resources-not-bound", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
-			tb.PipelineTask("some-task", "a-task-that-needs-a-resource"),
-			tb.PipelineDeclaredResource("workspace", "git"),
-		))),
-		tb.PipelineRun("embedded-pipeline-invalid", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
-			tb.PipelineTask("bad-t@$k", "b@d-t@$k"),
-		))),
-		tb.PipelineRun("embedded-pipeline-mismatching-param-type", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
-			tb.PipelineParamSpec("some-param", v1beta1.ParamTypeArray),
-			tb.PipelineTask("some-task", "a-task-that-needs-array-params")),
-			tb.PipelineRunParam("some-param", "stringval"),
-		)),
-		tb.PipelineRun("pipelinerun-missing-params", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
-			tb.PipelineParamSpec("some-param", v1beta1.ParamTypeString),
-			tb.PipelineTask("some-task", "a-task-that-needs-params")),
-		)),
-		tb.PipelineRun("pipeline-invalid-dag-graph", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
-			tb.PipelineTask("dag-task-1", "dag-task-1", tb.RunAfter("dag-task-1")),
-		))),
-		tb.PipelineRun("pipeline-invalid-final-graph", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
-			tb.PipelineTask("dag-task-1", "taskName"),
-			tb.FinalPipelineTask("final-task-1", "taskName"),
-			tb.FinalPipelineTask("final-task-1", "taskName")))),
-	}
 
-	d := test.Data{
-		Tasks:        ts,
-		Pipelines:    ps,
-		PipelineRuns: prs,
-	}
-	tcs := []struct {
+	for _, tc := range []struct {
 		name               string
 		pipelineRun        *v1beta1.PipelineRun
 		reason             string
 		hasNoDefaultLabels bool
 		permanentError     bool
 		wantEvents         []string
-	}{
-		{
-			name:               "invalid-pipeline-shd-be-stop-reconciling",
-			pipelineRun:        prs[0],
-			reason:             ReasonCouldntGetPipeline,
-			hasNoDefaultLabels: true,
-			permanentError:     true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed Error retrieving pipeline for pipelinerun",
-			},
-		}, {
-			name:           "invalid-pipeline-run-missing-tasks-shd-stop-reconciling",
-			pipelineRun:    prs[1],
-			reason:         ReasonCouldntGetTask,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed Pipeline foo/pipeline-missing-tasks can't be Run",
-			},
-		}, {
-			name:           "invalid-pipeline-run-params-dont-exist-shd-stop-reconciling",
-			pipelineRun:    prs[2],
-			reason:         ReasonFailedValidation,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed invalid input params for task a-task-that-needs-params: missing values",
-			},
-		}, {
-			name:           "invalid-pipeline-run-resources-not-bound-shd-stop-reconciling",
-			pipelineRun:    prs[3],
-			reason:         ReasonInvalidBindings,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo/pipeline-resources-not-bound doesn't bind Pipeline",
-			},
-		}, {
-			name:           "invalid-pipeline-run-missing-resource-shd-stop-reconciling",
-			pipelineRun:    prs[4],
-			reason:         ReasonCouldntGetResource,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo/pipeline-resources-dont-exist can't be Run; it tries to bind Resources",
-			},
-		}, {
-			name:           "invalid-pipeline-missing-declared-resource-shd-stop-reconciling",
-			pipelineRun:    prs[5],
-			reason:         ReasonFailedValidation,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed Pipeline foo/a-pipeline-that-should-be-caught-by-admission-control can't be Run; it has an invalid spec",
-			},
-		}, {
-			name:           "invalid-pipeline-mismatching-parameter-types",
-			pipelineRun:    prs[6],
-			reason:         ReasonParameterTypeMismatch,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo/pipeline-mismatching-param-type parameters have mismatching types",
-			},
-		}, {
-			name:           "invalid-pipeline-missing-conditions-shd-stop-reconciling",
-			pipelineRun:    prs[7],
-			reason:         ReasonCouldntGetCondition,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo/pipeline-conditions-missing can't be Run; it contains Conditions",
-			},
-		}, {
-			name:           "invalid-embedded-pipeline-resources-bot-bound-shd-stop-reconciling",
-			pipelineRun:    prs[8],
-			reason:         ReasonInvalidBindings,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo/embedded-pipeline-resources-not-bound doesn't bind Pipeline",
-			},
-		}, {
-			name:           "invalid-embedded-pipeline-bad-name-shd-stop-reconciling",
-			pipelineRun:    prs[9],
-			reason:         ReasonFailedValidation,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed Pipeline foo/embedded-pipeline-invalid can't be Run; it has an invalid spec",
-			},
-		}, {
-			name:           "invalid-embedded-pipeline-mismatching-parameter-types",
-			pipelineRun:    prs[10],
-			reason:         ReasonParameterTypeMismatch,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo/embedded-pipeline-mismatching-param-type parameters have mismatching types",
-			},
-		}, {
-			name:           "invalid-pipeline-run-missing-params-shd-stop-reconciling",
-			pipelineRun:    prs[11],
-			reason:         ReasonParameterMissing,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo parameters is missing some parameters required by Pipeline pipelinerun-missing-params",
-			},
-		}, {
-			name:           "invalid-pipeline-with-invalid-dag-graph",
-			pipelineRun:    prs[12],
-			reason:         ReasonInvalidGraph,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo/pipeline-invalid-dag-graph's Pipeline DAG is invalid",
-			},
-		}, {
-			name:           "invalid-pipeline-with-invalid-final-tasks-graph",
-			pipelineRun:    prs[13],
-			reason:         ReasonInvalidGraph,
-			permanentError: true,
-			wantEvents: []string{
-				"Normal Started",
-				"Warning Failed PipelineRun foo's Pipeline DAG is invalid for finally clause",
-			},
+	}{{
+		name:               "invalid-pipeline-shd-be-stop-reconciling",
+		pipelineRun:        tb.PipelineRun("invalid-pipeline", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("pipeline-not-exist")),
+		reason:             ReasonCouldntGetPipeline,
+		hasNoDefaultLabels: true,
+		permanentError:     true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed Error retrieving pipeline for pipelinerun",
 		},
-	}
-
-	for _, tc := range tcs {
+	}, {
+		name:           "invalid-pipeline-run-missing-tasks-shd-stop-reconciling",
+		pipelineRun:    tb.PipelineRun("pipelinerun-missing-tasks", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("pipeline-missing-tasks")),
+		reason:         ReasonCouldntGetTask,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed Pipeline foo/pipeline-missing-tasks can't be Run",
+		},
+	}, {
+		name:           "invalid-pipeline-run-params-dont-exist-shd-stop-reconciling",
+		pipelineRun:    tb.PipelineRun("pipeline-params-dont-exist", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-without-params")),
+		reason:         ReasonFailedValidation,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed invalid input params for task a-task-that-needs-params: missing values",
+		},
+	}, {
+		name:           "invalid-pipeline-run-resources-not-bound-shd-stop-reconciling",
+		pipelineRun:    tb.PipelineRun("pipeline-resources-not-bound", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-fine-pipeline")),
+		reason:         ReasonInvalidBindings,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo/pipeline-resources-not-bound doesn't bind Pipeline",
+		},
+	}, {
+		name: "invalid-pipeline-run-missing-resource-shd-stop-reconciling",
+		pipelineRun: tb.PipelineRun("pipeline-resources-dont-exist", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-fine-pipeline",
+			tb.PipelineRunResourceBinding("a-resource", tb.PipelineResourceBindingRef("missing-resource")))),
+		reason:         ReasonCouldntGetResource,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo/pipeline-resources-dont-exist can't be Run; it tries to bind Resources",
+		},
+	}, {
+		name:           "invalid-pipeline-missing-declared-resource-shd-stop-reconciling",
+		pipelineRun:    tb.PipelineRun("pipeline-resources-not-declared", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-that-should-be-caught-by-admission-control")),
+		reason:         ReasonFailedValidation,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed Pipeline foo/a-pipeline-that-should-be-caught-by-admission-control can't be Run; it has an invalid spec",
+		},
+	}, {
+		name:           "invalid-pipeline-mismatching-parameter-types",
+		pipelineRun:    tb.PipelineRun("pipeline-mismatching-param-type", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-with-array-params", tb.PipelineRunParam("some-param", "stringval"))),
+		reason:         ReasonParameterTypeMismatch,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo/pipeline-mismatching-param-type parameters have mismatching types",
+		},
+	}, {
+		name:           "invalid-pipeline-missing-conditions-shd-stop-reconciling",
+		pipelineRun:    tb.PipelineRun("pipeline-conditions-missing", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("a-pipeline-with-missing-conditions")),
+		reason:         ReasonCouldntGetCondition,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo/pipeline-conditions-missing can't be Run; it contains Conditions",
+		},
+	}, {
+		name: "invalid-embedded-pipeline-resources-bot-bound-shd-stop-reconciling",
+		pipelineRun: tb.PipelineRun("embedded-pipeline-resources-not-bound", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
+			tb.PipelineTask("some-task", "a-task-that-needs-a-resource"),
+			tb.PipelineDeclaredResource("workspace", "git"),
+		))),
+		reason:         ReasonInvalidBindings,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo/embedded-pipeline-resources-not-bound doesn't bind Pipeline",
+		},
+	}, {
+		name: "invalid-embedded-pipeline-bad-name-shd-stop-reconciling",
+		pipelineRun: tb.PipelineRun("embedded-pipeline-invalid", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
+			tb.PipelineTask("bad-t@$k", "b@d-t@$k"),
+		))),
+		reason:         ReasonFailedValidation,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed Pipeline foo/embedded-pipeline-invalid can't be Run; it has an invalid spec",
+		},
+	}, {
+		name: "invalid-embedded-pipeline-mismatching-parameter-types",
+		pipelineRun: tb.PipelineRun("embedded-pipeline-mismatching-param-type", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
+			tb.PipelineParamSpec("some-param", v1beta1.ParamTypeArray),
+			tb.PipelineTask("some-task", "a-task-that-needs-array-params")),
+			tb.PipelineRunParam("some-param", "stringval"),
+		)),
+		reason:         ReasonParameterTypeMismatch,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo/embedded-pipeline-mismatching-param-type parameters have mismatching types",
+		},
+	}, {
+		name: "invalid-pipeline-run-missing-params-shd-stop-reconciling",
+		pipelineRun: tb.PipelineRun("pipelinerun-missing-params", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
+			tb.PipelineParamSpec("some-param", v1beta1.ParamTypeString),
+			tb.PipelineTask("some-task", "a-task-that-needs-params")),
+		)),
+		reason:         ReasonParameterMissing,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo parameters is missing some parameters required by Pipeline pipelinerun-missing-params",
+		},
+	}, {
+		name: "invalid-pipeline-with-invalid-dag-graph",
+		pipelineRun: tb.PipelineRun("pipeline-invalid-dag-graph", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
+			tb.PipelineTask("dag-task-1", "dag-task-1", tb.RunAfter("dag-task-1")),
+		))),
+		reason:         ReasonInvalidGraph,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo/pipeline-invalid-dag-graph's Pipeline DAG is invalid",
+		},
+	}, {
+		name: "invalid-pipeline-with-invalid-final-tasks-graph",
+		pipelineRun: tb.PipelineRun("pipeline-invalid-final-graph", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("", tb.PipelineRunPipelineSpec(
+			tb.PipelineTask("dag-task-1", "taskName"),
+			tb.FinalPipelineTask("final-task-1", "taskName"),
+			tb.FinalPipelineTask("final-task-1", "taskName")))),
+		reason:         ReasonInvalidGraph,
+		permanentError: true,
+		wantEvents: []string{
+			"Normal Started",
+			"Warning Failed PipelineRun foo's Pipeline DAG is invalid for finally clause",
+		},
+	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			testAssets, cancel := getPipelineRunController(t, d)
-			defer cancel()
-			c := testAssets.Controller
+			d := test.Data{
+				PipelineRuns: []*v1beta1.PipelineRun{tc.pipelineRun},
+				Pipelines:    ps,
+				Tasks:        ts,
+			}
+			prt := NewPipelineRunTest(d, t)
+			defer prt.Cancel()
 
-			// When a PipelineRun is invalid and can't run, we expect a permanent error that will
-			// tell the Reconciler to not keep trying to reconcile.
-			reconcileError := c.Reconciler.Reconcile(context.Background(), getRunName(tc.pipelineRun))
-			if reconcileError == nil {
-				t.Fatalf("Expected an error to be returned by Reconcile, got nil instead")
-			}
-			if controller.IsPermanentError(reconcileError) != tc.permanentError {
-				t.Fatalf("Expected the error to be permanent: %v but got permanent: %v", tc.permanentError, controller.IsPermanentError(reconcileError))
-			}
-
-			reconciledRun, err := testAssets.Clients.Pipeline.TektonV1beta1().PipelineRuns(tc.pipelineRun.Namespace).Get(tc.pipelineRun.Name, metav1.GetOptions{})
-			if err != nil {
-				t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
-			}
+			wantEvents := append(tc.wantEvents, "Warning InternalError 1 error occurred")
+			reconciledRun, _ := prt.reconcileRun("foo", tc.pipelineRun.Name, wantEvents, tc.permanentError)
 
 			if reconciledRun.Status.CompletionTime == nil {
 				t.Errorf("Expected a CompletionTime on invalid PipelineRun but was nil")
@@ -732,12 +763,6 @@ func TestReconcile_InvalidPipelineRuns(t *testing.T) {
 					}
 				}
 			}
-			// Check generated events match what's expected
-			wantEvents := append(tc.wantEvents, "Warning InternalError 1 error occurred")
-			err = checkEvents(t, testAssets.Recorder, tc.pipelineRun.Name, wantEvents)
-			if !(err == nil) {
-				t.Errorf(err.Error())
-			}
 		})
 	}
 }
@@ -769,7 +794,7 @@ func TestReconcile_InvalidPipelineRunNames(t *testing.T) {
 			defer cancel()
 			c := testAssets.Controller
 
-			err := c.Reconciler.Reconcile(context.Background(), tc.pipelineRun)
+			err := c.Reconciler.Reconcile(testAssets.Ctx, tc.pipelineRun)
 			// No reason to keep reconciling something that doesnt or can't exist
 			if err != nil {
 				t.Errorf("Did not expect to see error when reconciling invalid PipelineRun but saw %q", err)
@@ -783,7 +808,12 @@ func TestUpdateTaskRunsState(t *testing.T) {
 	// from a TaskRun associated to the PipelineRun
 	pr := tb.PipelineRun("test-pipeline-run", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("test-pipeline"))
 	pipelineTask := v1beta1.PipelineTask{
-		Name:    "unit-test-1",
+		Name: "unit-test-1",
+		WhenExpressions: []v1beta1.WhenExpression{{
+			Input:    "foo",
+			Operator: selection.In,
+			Values:   []string{"foo", "bar"},
+		}},
 		TaskRef: &v1beta1.TaskRef{Name: "unit-test-task"},
 	}
 	task := tb.Task("unit-test-task", tb.TaskSpec(
@@ -813,6 +843,11 @@ func TestUpdateTaskRunsState(t *testing.T) {
 				Conditions: []apis.Condition{{Type: apis.ConditionSucceeded}},
 			},
 		},
+		WhenExpressions: []v1beta1.WhenExpression{{
+			Input:    "foo",
+			Operator: selection.In,
+			Values:   []string{"foo", "bar"},
+		}},
 	}
 	expectedPipelineRunStatus := v1beta1.PipelineRunStatus{
 		PipelineRunStatusFields: v1beta1.PipelineRunStatusFields{
@@ -820,7 +855,7 @@ func TestUpdateTaskRunsState(t *testing.T) {
 		},
 	}
 
-	state := []*resources.ResolvedPipelineRunTask{{
+	state := resources.PipelineRunState{{
 		PipelineTask: &pipelineTask,
 		TaskRunName:  "test-pipeline-run-success-unit-test-1",
 		TaskRun:      taskrun,
@@ -829,8 +864,8 @@ func TestUpdateTaskRunsState(t *testing.T) {
 		},
 	}}
 	pr.Status.InitializeConditions()
-	status := getTaskRunsStatus(pr, state)
-	if d := cmp.Diff(status, expectedPipelineRunStatus.TaskRuns); d != "" {
+	status := state.GetTaskRunsStatus(pr)
+	if d := cmp.Diff(expectedPipelineRunStatus.TaskRuns, status); d != "" {
 		t.Fatalf("Expected PipelineRun status to match TaskRun(s) status, but got a mismatch: %s", diff.PrintWantGot(d))
 	}
 
@@ -962,13 +997,13 @@ func TestUpdateTaskRunStateWithConditionChecks(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pr := tb.PipelineRun("test-pipeline-run", tb.PipelineRunNamespace("foo"), tb.PipelineRunSpec("test-pipeline"))
 
-			state := []*resources.ResolvedPipelineRunTask{{
+			state := resources.PipelineRunState{{
 				PipelineTask:            &pipelineTask,
 				TaskRunName:             taskrunName,
 				ResolvedConditionChecks: tc.rcc,
 			}}
 			pr.Status.InitializeConditions()
-			status := getTaskRunsStatus(pr, state)
+			status := state.GetTaskRunsStatus(pr)
 			expected := map[string]*v1beta1.PipelineRunTaskRunStatus{
 				taskrunName: &tc.expectedStatus,
 			}
@@ -1017,28 +1052,28 @@ func TestReconcileOnCompletedPipelineRun(t *testing.T) {
 			),
 		),
 	}
+
 	d := test.Data{
 		PipelineRuns: prs,
 		Pipelines:    ps,
 		Tasks:        ts,
 		TaskRuns:     trs,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	if err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-completed"); err != nil {
-		t.Fatalf("Error reconciling: %s", err)
+	wantEvents := []string{
+		"Normal Succeeded All Tasks have completed executing",
 	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-completed", wantEvents, false)
 
 	actions := clients.Pipeline.Actions()
-	if len(actions) != 2 {
+	if len(actions) < 2 {
 		t.Errorf("# Actions: %d, Actions: %#v", len(actions), actions)
-		t.Fatalf("Expected client to have updated the TaskRun status for a completed PipelineRun, but it did not")
+		t.Fatalf("Expected client to have at least two action implementation")
 	}
 
+	_ = getPipelineRunUpdates(t, actions)
 	pipelineUpdates := 0
 	for _, action := range actions {
 		if action != nil {
@@ -1054,12 +1089,6 @@ func TestReconcileOnCompletedPipelineRun(t *testing.T) {
 	if pipelineUpdates != 1 {
 		// If only the pipelinerun status changed, we expect one update
 		t.Fatalf("Expected client to have updated the pipelinerun twice, but it did %d times", pipelineUpdates)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-completed", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
 	}
 
 	// This PipelineRun should still be complete and the status should reflect that
@@ -1079,14 +1108,6 @@ func TestReconcileOnCompletedPipelineRun(t *testing.T) {
 
 	if d := cmp.Diff(reconciledRun.Status.TaskRuns, expectedTaskRunsStatus); d != "" {
 		t.Fatalf("Expected PipelineRun status to match TaskRun(s) status, but got a mismatch %s", diff.PrintWantGot(d))
-	}
-
-	wantEvents := []string{
-		"Normal Succeeded All Tasks have completed executing",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-completed", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
 	}
 }
 
@@ -1122,22 +1143,13 @@ func TestReconcileOnCancelledPipelineRun(t *testing.T) {
 		Tasks:        ts,
 		TaskRuns:     trs,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-cancelled")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
+	wantEvents := []string{
+		"Warning Failed PipelineRun \"test-pipeline-run-cancelled\" was cancelled",
 	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-cancelled", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
+	reconciledRun, _ := prt.reconcileRun("foo", "test-pipeline-run-cancelled", wantEvents, false)
 
 	if reconciledRun.Status.CompletionTime == nil {
 		t.Errorf("Expected a CompletionTime on invalid PipelineRun but was nil")
@@ -1146,14 +1158,6 @@ func TestReconcileOnCancelledPipelineRun(t *testing.T) {
 	// This PipelineRun should still be complete and false, and the status should reflect that
 	if !reconciledRun.Status.GetCondition(apis.ConditionSucceeded).IsFalse() {
 		t.Errorf("Expected PipelineRun status to be complete and false, but was %v", reconciledRun.Status.GetCondition(apis.ConditionSucceeded))
-	}
-
-	wantEvents := []string{
-		"Warning Failed PipelineRun \"test-pipeline-run-cancelled\" was cancelled",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-cancelled", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
 	}
 }
 
@@ -1179,22 +1183,13 @@ func TestReconcileWithTimeout(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-with-timeout")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
+	wantEvents := []string{
+		"Warning Failed PipelineRun \"test-pipeline-run-with-timeout\" failed to finish within \"12h0m0s\"",
 	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-with-timeout", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-with-timeout", wantEvents, false)
 
 	if reconciledRun.Status.CompletionTime == nil {
 		t.Errorf("Expected a CompletionTime on invalid PipelineRun but was nil")
@@ -1205,22 +1200,17 @@ func TestReconcileWithTimeout(t *testing.T) {
 		t.Errorf("Expected PipelineRun to be timed out, but condition reason is %s", reconciledRun.Status.GetCondition(apis.ConditionSucceeded))
 	}
 
-	// Check that the expected TaskRun was created
-	actual := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
-	if actual == nil {
-		t.Fatalf("Expected a TaskRun to be created, but it wasn't.")
+	actions := clients.Pipeline.Actions()
+	if len(actions) < 2 {
+		t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 	}
+
+	// Check that the expected TaskRun was created
+	actual := getTaskRunCreations(t, actions)[0]
 
 	// The TaskRun timeout should be less than or equal to the PipelineRun timeout.
 	if actual.Spec.Timeout.Duration > prs[0].Spec.Timeout.Duration {
 		t.Errorf("TaskRun timeout %s should be less than or equal to PipelineRun timeout %s", actual.Spec.Timeout.Duration.String(), prs[0].Spec.Timeout.Duration.String())
-	}
-	wantEvents := []string{
-		"Warning Failed PipelineRun \"test-pipeline-run-with-timeout\" failed to finish within \"12h0m0s\"",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-with-timeout", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
 	}
 }
 
@@ -1242,25 +1232,14 @@ func TestReconcileWithoutPVC(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling PipelineRun but saw %s", err)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
-	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run", []string{}, false)
+	actions := clients.Pipeline.Actions()
 
 	// Check that the expected TaskRun was created
-	for _, a := range clients.Kube.Actions() {
+	for _, a := range actions {
 		if ca, ok := a.(ktesting.CreateAction); ok {
 			obj := ca.GetObject()
 			if pvc, ok := obj.(*corev1.PersistentVolumeClaim); ok {
@@ -1294,9 +1273,9 @@ func TestReconcileCancelledFailsTaskRunCancellation(t *testing.T) {
 				Reason:  v1beta1.PipelineRunReasonRunning.String(),
 				Message: "running...",
 			}),
-			tb.PipelineRunTaskRunsStatus(prName+ptName, &v1alpha1.PipelineRunTaskRunStatus{
+			tb.PipelineRunTaskRunsStatus(prName+ptName, &v1beta1.PipelineRunTaskRunStatus{
 				PipelineTaskName: ptName,
-				Status:           &v1alpha1.TaskRunStatus{},
+				Status:           &v1beta1.TaskRunStatus{},
 			}),
 			tb.PipelineRunStartTime(time.Now()),
 		),
@@ -1312,17 +1291,17 @@ func TestReconcileCancelledFailsTaskRunCancellation(t *testing.T) {
 	clients := testAssets.Clients
 
 	// Make the patch call fail, i.e. make it so that the controller fails to cancel the TaskRun
-	clients.Pipeline.PrependReactor("patch", "taskruns", func(action k8stesting.Action) (bool, runtime.Object, error) {
+	clients.Pipeline.PrependReactor("patch", "taskruns", func(action ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, fmt.Errorf("i'm sorry Dave, i'm afraid i can't do that")
 	})
 
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-fails-to-cancel")
+	err := c.Reconciler.Reconcile(testAssets.Ctx, "foo/test-pipeline-fails-to-cancel")
 	if err == nil {
 		t.Errorf("Expected to see error returned from reconcile after failing to cancel TaskRun but saw none!")
 	}
 
 	// Check that the PipelineRun is still running with correct error message
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-fails-to-cancel", metav1.GetOptions{})
+	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get(testAssets.Ctx, "test-pipeline-fails-to-cancel", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
 	}
@@ -1368,22 +1347,14 @@ func TestReconcileCancelledPipelineRun(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-cancelled")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
+	wantEvents := []string{
+		"Warning Failed PipelineRun \"test-pipeline-run-cancelled\" was cancelled",
 	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-cancelled", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-cancelled", wantEvents, false)
+	actions := clients.Pipeline.Actions()
 
 	// The PipelineRun should be still cancelled.
 	if reconciledRun.Status.GetCondition(apis.ConditionSucceeded).Reason != ReasonCancelled {
@@ -1391,20 +1362,11 @@ func TestReconcileCancelledPipelineRun(t *testing.T) {
 	}
 
 	// Check that no TaskRun is created or run
-	actions := clients.Pipeline.Actions()
 	for _, action := range actions {
 		actionType := fmt.Sprintf("%T", action)
 		if !(actionType == "testing.UpdateActionImpl" || actionType == "testing.GetActionImpl") {
 			t.Errorf("Expected a TaskRun to be get/updated, but it was %s", actionType)
 		}
-	}
-
-	wantEvents := []string{
-		"Warning Failed PipelineRun \"test-pipeline-run-cancelled\" was cancelled",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-cancelled", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
 	}
 }
 
@@ -1424,12 +1386,6 @@ func TestReconcilePropagateLabels(t *testing.T) {
 	)}
 	ts := []*v1beta1.Task{tb.Task("hello-world", tb.TaskNamespace("foo"))}
 
-	d := test.Data{
-		PipelineRuns: prs,
-		Pipelines:    ps,
-		Tasks:        ts,
-	}
-
 	expected := tb.TaskRun("test-pipeline-run-with-labels-hello-world-1-9l9zj",
 		tb.TaskRunNamespace("foo"),
 		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run-with-labels",
@@ -1446,28 +1402,22 @@ func TestReconcilePropagateLabels(t *testing.T) {
 		),
 	)
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-with-labels")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	// Check that the PipelineRun was reconciled correctly
-	_, err = clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-with-labels", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
+	_, clients := prt.reconcileRun("foo", "test-pipeline-run-with-labels", []string{}, false)
+	actions := clients.Pipeline.Actions()
+	if len(actions) < 2 {
+		t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 	}
 
 	// Check that the expected TaskRun was created
-	actual := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
-	if actual == nil {
-		t.Errorf("Expected a TaskRun to be created, but it wasn't.")
-	}
-
+	actual := getTaskRunCreations(t, actions)[0]
 	if d := cmp.Diff(actual, expected); d != "" {
 		t.Errorf("expected to see TaskRun %v created. Diff %s", expected, diff.PrintWantGot(d))
 	}
@@ -1495,23 +1445,11 @@ func TestReconcileWithDifferentServiceAccounts(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
+	_, clients := prt.reconcileRun("foo", "test-pipeline-run-different-service-accs", []string{}, false)
 
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-different-service-accs")
-
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	_, err = clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-different-service-accs", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
 	taskRunNames := []string{"test-pipeline-run-different-service-accs-hello-world-0-9l9zj", "test-pipeline-run-different-service-accs-hello-world-1-mz4c7"}
 
 	expectedTaskRuns := []*v1beta1.TaskRun{
@@ -1546,7 +1484,7 @@ func TestReconcileWithDifferentServiceAccounts(t *testing.T) {
 	}
 	for i := range ps[0].Spec.Tasks {
 		// Check that the expected TaskRun was created
-		actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").Get(taskRunNames[i], metav1.GetOptions{})
+		actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").Get(prt.TestAssets.Ctx, taskRunNames[i], metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("Expected a TaskRun to be created, but it wasn't: %s", err)
 		}
@@ -1555,40 +1493,33 @@ func TestReconcileWithDifferentServiceAccounts(t *testing.T) {
 		}
 
 	}
-
 }
 
+// TestReconcileWithTimeoutAndRetry runs "Reconcile" against pipelines with
+// retries and timeout settings, and status that represents different number of
+// retries already performed.  It verifies the reconciled status and events
+// generated
 func TestReconcileWithTimeoutAndRetry(t *testing.T) {
-	// TestReconcileWithTimeoutAndRetry runs "Reconcile" against pipelines with retries and timeout settings,
-	// and status that represents different number of retries already performed.
-	// It verifies the reconciled status and events generated
-
-	tcs := []struct {
+	for _, tc := range []struct {
 		name               string
 		retries            int
 		conditionSucceeded corev1.ConditionStatus
 		wantEvents         []string
-	}{
-		{
-			name:               "One try has to be done",
-			retries:            1,
-			conditionSucceeded: corev1.ConditionFalse,
-			wantEvents: []string{
-				"Warning Failed PipelineRun \"test-pipeline-retry-run-with-timeout\" failed to finish within",
-			},
+	}{{
+		name:               "One try has to be done",
+		retries:            1,
+		conditionSucceeded: corev1.ConditionFalse,
+		wantEvents: []string{
+			"Warning Failed PipelineRun \"test-pipeline-retry-run-with-timeout\" failed to finish within",
 		},
-		{
-			name:               "No more retries are needed",
-			retries:            2,
-			conditionSucceeded: corev1.ConditionUnknown,
-			wantEvents: []string{
-				"Warning Failed PipelineRun \"test-pipeline-retry-run-with-timeout\" failed to finish within",
-			},
+	}, {
+		name:               "No more retries are needed",
+		retries:            2,
+		conditionSucceeded: corev1.ConditionUnknown,
+		wantEvents: []string{
+			"Warning Failed PipelineRun \"test-pipeline-retry-run-with-timeout\" failed to finish within",
 		},
-	}
-
-	for _, tc := range tcs {
-
+	}} {
 		t.Run(tc.name, func(t *testing.T) {
 			ps := []*v1beta1.Pipeline{tb.Pipeline("test-pipeline-retry", tb.PipelineNamespace("foo"), tb.PipelineSpec(
 				tb.PipelineTask("hello-world-1", "hello-world", tb.Retries(tc.retries)),
@@ -1638,22 +1569,10 @@ func TestReconcileWithTimeoutAndRetry(t *testing.T) {
 				Tasks:        ts,
 				TaskRuns:     trs,
 			}
+			prt := NewPipelineRunTest(d, t)
+			defer prt.Cancel()
 
-			testAssets, cancel := getPipelineRunController(t, d)
-			defer cancel()
-			c := testAssets.Controller
-			clients := testAssets.Clients
-
-			err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-retry-run-with-timeout")
-			if err != nil {
-				t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
-			}
-
-			// Check that the PipelineRun was reconciled correctly
-			reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-retry-run-with-timeout", metav1.GetOptions{})
-			if err != nil {
-				t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-			}
+			reconciledRun, _ := prt.reconcileRun("foo", "test-pipeline-retry-run-with-timeout", []string{}, false)
 
 			if len(reconciledRun.Status.TaskRuns["hello-world-1"].Status.RetriesStatus) != tc.retries {
 				t.Fatalf(" %d retry expected but %d ", tc.retries, len(reconciledRun.Status.TaskRuns["hello-world-1"].Status.RetriesStatus))
@@ -1661,10 +1580,6 @@ func TestReconcileWithTimeoutAndRetry(t *testing.T) {
 
 			if status := reconciledRun.Status.TaskRuns["hello-world-1"].Status.GetCondition(apis.ConditionSucceeded).Status; status != tc.conditionSucceeded {
 				t.Fatalf("Succeeded expected to be %s but is %s", tc.conditionSucceeded, status)
-			}
-			err = checkEvents(t, testAssets.Recorder, prs[0].Name, tc.wantEvents)
-			if !(err == nil) {
-				t.Errorf(err.Error())
 			}
 		})
 	}
@@ -1689,28 +1604,18 @@ func TestReconcilePropagateAnnotations(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
+	_, clients := prt.reconcileRun("foo", "test-pipeline-run-with-annotations", []string{}, false)
 
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-with-annotations")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	_, err = clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-with-annotations", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
+	actions := clients.Pipeline.Actions()
+	if len(actions) < 2 {
+		t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 	}
 
 	// Check that the expected TaskRun was created
-	actual := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
-	if actual == nil {
-		t.Errorf("Expected a TaskRun to be created, but it wasn't.")
-	}
+	actual := getTaskRunCreations(t, actions)[0]
 	expectedTaskRun := tb.TaskRun("test-pipeline-run-with-annotations-hello-world-1-9l9zj",
 		tb.TaskRunNamespace("foo"),
 		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run-with-annotations",
@@ -1817,7 +1722,7 @@ func TestGetTaskRunTimeout(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			if d := cmp.Diff(getTaskRunTimeout(tc.pr, tc.rprt), tc.expected); d != "" {
+			if d := cmp.Diff(getTaskRunTimeout(context.TODO(), tc.pr, tc.rprt), tc.expected); d != "" {
 				t.Errorf("Unexpected task run timeout. Diff %s", diff.PrintWantGot(d))
 			}
 		})
@@ -1854,28 +1759,18 @@ func TestReconcileAndPropagateCustomPipelineTaskRunSpec(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
+	_, clients := prt.reconcileRun("foo", prName, []string{}, false)
+	actions := clients.Pipeline.Actions()
 
-	err := c.Reconciler.Reconcile(context.Background(), "foo/"+prName)
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	_, err = clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get(prName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
+	if len(actions) < 2 {
+		t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 	}
 
 	// Check that the expected TaskRun was created
-	actual := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
-	if actual == nil {
-		t.Errorf("Expected a TaskRun to be created, but it wasn't.")
-	}
+	actual := getTaskRunCreations(t, actions)[0]
 	expectedTaskRun := tb.TaskRun("test-pipeline-run-hello-world-1-9l9zj",
 		tb.TaskRunNamespace("foo"),
 		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run",
@@ -1953,22 +1848,15 @@ func TestReconcileWithConditionChecks(t *testing.T) {
 		Tasks:        ts,
 		Conditions:   conditions,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/"+prName)
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 0 \\(Failed: 0, Cancelled 0\\), Incomplete: 1, Skipped: 0",
 	}
+	_, clients := prt.reconcileRun("foo", prName, wantEvents, false)
 
-	// Check that the PipelineRun was reconciled correctly
-	_, err = clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get(prName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
 	ccNameBase := prName + "-hello-world-1-9l9zj"
 	ccNames := map[string]string{
 		"cond-1": ccNameBase + "-cond-1-0-mz4c7",
@@ -1979,25 +1867,15 @@ func TestReconcileWithConditionChecks(t *testing.T) {
 		expectedConditionChecks[index] = makeExpectedTr(condition.Name, ccNames[condition.Name], condition.Labels, condition.Annotations)
 	}
 
-	// Check that the expected TaskRun was created
-	condCheck0 := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
-	condCheck1 := clients.Pipeline.Actions()[2].(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
-	if condCheck0 == nil || condCheck1 == nil {
-		t.Errorf("Expected two ConditionCheck TaskRuns to be created, but it wasn't.")
+	actions := clients.Pipeline.Actions()
+	if len(actions) < 3 {
+		t.Fatalf("Expected client to have at least three action implementation but it has %d", len(actions))
 	}
 
-	actual := []*v1beta1.TaskRun{condCheck0, condCheck1}
+	// Check that the expected TaskRun was created
+	actual := getTaskRunCreations(t, actions)
 	if d := cmp.Diff(actual, expectedConditionChecks); d != "" {
 		t.Errorf("expected to see 2 ConditionCheck TaskRuns created. Diff %s", diff.PrintWantGot(d))
-	}
-
-	wantEvents := []string{
-		"Normal Started",
-		"Normal Running Tasks Completed: 0 \\(Failed: 0, Cancelled 0\\), Incomplete: 1, Skipped: 0",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-completed", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
 	}
 }
 
@@ -2074,35 +1952,30 @@ func TestReconcileWithFailingConditionChecks(t *testing.T) {
 			),
 		),
 	}
+
 	d := test.Data{
 		PipelineRuns: prs,
 		Pipelines:    ps,
 		Tasks:        ts,
-		Conditions:   conditions,
 		TaskRuns:     trs,
+		Conditions:   conditions,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-with-conditions")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 1 \\(Failed: 0, Cancelled 0\\), Incomplete: 1, Skipped: 1",
 	}
+	_, clients := prt.reconcileRun("foo", pipelineRunName, wantEvents, false)
 
-	// Check that the PipelineRun was reconciled correctly
-	_, err = clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-with-conditions", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
+	actions := clients.Pipeline.Actions()
+	if len(actions) < 2 {
+		t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 	}
 
 	// Check that the expected TaskRun was created
-	actual := clients.Pipeline.Actions()[1].(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
-	if actual == nil {
-		t.Errorf("Expected a ConditionCheck TaskRun to be created, but it wasn't.")
-	}
+	actual := getTaskRunCreations(t, actions)[0]
 	expectedTaskRun := tb.TaskRun("test-pipeline-run-with-conditions-task-3-9l9zj",
 		tb.TaskRunNamespace("foo"),
 		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run-with-conditions",
@@ -2121,15 +1994,6 @@ func TestReconcileWithFailingConditionChecks(t *testing.T) {
 
 	if d := cmp.Diff(actual, expectedTaskRun); d != "" {
 		t.Errorf("expected to see ConditionCheck TaskRun %v created. Diff %s", expectedTaskRun, diff.PrintWantGot(d))
-	}
-
-	wantEvents := []string{
-		"Normal Started",
-		"Normal Running Tasks Completed: 1 \\(Failed: 0, Cancelled 0\\), Incomplete: 1, Skipped: 1",
-	}
-	err = checkEvents(t, testAssets.Recorder, "test-pipeline-run-completed", wantEvents)
-	if !(err == nil) {
-		t.Errorf(err.Error())
 	}
 }
 
@@ -2157,9 +2021,9 @@ func makeExpectedTr(condName, ccName string, labels, annotations map[string]stri
 	)
 }
 
-func ensurePVCCreated(t *testing.T, clients test.Clients, name, namespace string) {
+func ensurePVCCreated(ctx context.Context, t *testing.T, clients test.Clients, name, namespace string) {
 	t.Helper()
-	_, err := clients.Kube.CoreV1().PersistentVolumeClaims(namespace).Get(name, metav1.GetOptions{})
+	_, err := clients.Kube.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Expected PVC %s to be created for VolumeResource but did not exist", name)
 	}
@@ -2171,6 +2035,260 @@ func ensurePVCCreated(t *testing.T, clients test.Clients, name, namespace string
 	}
 	if !pvcCreated {
 		t.Errorf("Expected to see volume resource PVC created but didn't")
+	}
+}
+
+func TestReconcileWithWhenExpressionsWithParameters(t *testing.T) {
+	names.TestingSeed()
+	prName := "test-pipeline-run"
+	ps := []*v1beta1.Pipeline{tb.Pipeline("test-pipeline", tb.PipelineNamespace("foo"), tb.PipelineSpec(
+		tb.PipelineParamSpec("run", v1beta1.ParamTypeString),
+		tb.PipelineTask("hello-world-1", "hello-world-1",
+			tb.PipelineTaskWhenExpression("foo", selection.NotIn, []string{"bar"}),
+			tb.PipelineTaskWhenExpression("$(params.run)", selection.In, []string{"yes"})),
+		tb.PipelineTask("hello-world-2", "hello-world-2",
+			tb.PipelineTaskWhenExpression("$(params.run)", selection.NotIn, []string{"yes"})),
+	))}
+	prs := []*v1beta1.PipelineRun{tb.PipelineRun(prName, tb.PipelineRunNamespace("foo"),
+		tb.PipelineRunAnnotation("PipelineRunAnnotation", "PipelineRunValue"),
+		tb.PipelineRunSpec("test-pipeline",
+			tb.PipelineRunServiceAccountName("test-sa"),
+			tb.PipelineRunParam("run", "yes"),
+		),
+	)}
+	ts := []*v1beta1.Task{
+		tb.Task("hello-world-1", tb.TaskNamespace("foo")),
+		tb.Task("hello-world-2", tb.TaskNamespace("foo")),
+	}
+
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+		Tasks:        ts,
+	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
+
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 0 \\(Failed: 0, Cancelled 0\\), Incomplete: 1, Skipped: 1",
+	}
+	pipelineRun, clients := prt.reconcileRun("foo", prName, wantEvents, false)
+
+	// Check that the expected TaskRun was created
+	actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+		LabelSelector: "tekton.dev/pipelineTask=hello-world-1,tekton.dev/pipelineRun=test-pipeline-run",
+		Limit:         1,
+	})
+	if err != nil {
+		t.Fatalf("Failure to list TaskRun's %s", err)
+	}
+	if len(actual.Items) != 1 {
+		t.Fatalf("Expected 1 TaskRun got %d", len(actual.Items))
+	}
+	expectedTaskRunName := "test-pipeline-run-hello-world-1-9l9zj"
+	expectedTaskRun := tb.TaskRun(expectedTaskRunName,
+		tb.TaskRunNamespace("foo"),
+		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run",
+			tb.OwnerReferenceAPIVersion("tekton.dev/v1beta1"),
+			tb.Controller, tb.BlockOwnerDeletion,
+		),
+		tb.TaskRunLabel(pipeline.GroupName+pipeline.PipelineLabelKey, "test-pipeline"),
+		tb.TaskRunLabel(pipeline.GroupName+pipeline.PipelineTaskLabelKey, "hello-world-1"),
+		tb.TaskRunLabel(pipeline.GroupName+pipeline.PipelineRunLabelKey, "test-pipeline-run"),
+		tb.TaskRunAnnotation("PipelineRunAnnotation", "PipelineRunValue"),
+		tb.TaskRunSpec(
+			tb.TaskRunTaskRef("hello-world-1"),
+			tb.TaskRunServiceAccountName("test-sa"),
+		),
+	)
+	actualTaskRun := actual.Items[0]
+	if d := cmp.Diff(&actualTaskRun, expectedTaskRun, ignoreResourceVersion); d != "" {
+		t.Errorf("expected to see TaskRun %v created. Diff %s", expectedTaskRunName, diff.PrintWantGot(d))
+	}
+
+	actualWhenExpressionsInTaskRun := pipelineRun.Status.PipelineRunStatusFields.TaskRuns[expectedTaskRunName].WhenExpressions
+	expectedWhenExpressionsInTaskRun := []v1beta1.WhenExpression{{
+		Input:    "foo",
+		Operator: "notin",
+		Values:   []string{"bar"},
+	}, {
+		Input:    "yes",
+		Operator: "in",
+		Values:   []string{"yes"},
+	}}
+	if d := cmp.Diff(expectedWhenExpressionsInTaskRun, actualWhenExpressionsInTaskRun); d != "" {
+		t.Errorf("expected to see When Expressions %v created. Diff %s", expectedTaskRunName, diff.PrintWantGot(d))
+	}
+
+	actualSkippedTasks := pipelineRun.Status.SkippedTasks
+	expectedSkippedTasks := []v1beta1.SkippedTask{{
+		Name: "hello-world-2",
+		WhenExpressions: v1beta1.WhenExpressions{{
+			Input:    "yes",
+			Operator: "notin",
+			Values:   []string{"yes"},
+		}},
+	}}
+	if d := cmp.Diff(actualSkippedTasks, expectedSkippedTasks); d != "" {
+		t.Errorf("expected to find Skipped Tasks %v. Diff %s", expectedSkippedTasks, diff.PrintWantGot(d))
+	}
+
+	skippedTasks := []string{"hello-world-2"}
+	for _, skippedTask := range skippedTasks {
+		labelSelector := fmt.Sprintf("tekton.dev/pipelineTask=%s,tekton.dev/pipelineRun=test-pipeline-run-different-service-accs", skippedTask)
+		actualSkippedTask, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+			Limit:         1,
+		})
+		if err != nil {
+			t.Fatalf("Failure to list TaskRun's %s", err)
+		}
+		if len(actualSkippedTask.Items) != 0 {
+			t.Fatalf("Expected 0 TaskRuns got %d", len(actualSkippedTask.Items))
+		}
+	}
+}
+
+func TestReconcileWithWhenExpressionsWithTaskResults(t *testing.T) {
+	names.TestingSeed()
+	ps := []*v1beta1.Pipeline{tb.Pipeline("test-pipeline", tb.PipelineNamespace("foo"), tb.PipelineSpec(
+		tb.PipelineTask("a-task", "a-task"),
+		tb.PipelineTask("b-task", "b-task",
+			tb.PipelineTaskWhenExpression("$(tasks.a-task.results.aResult)", selection.In, []string{"aResultValue"}),
+			tb.PipelineTaskWhenExpression("aResultValue", selection.In, []string{"$(tasks.a-task.results.aResult)"}),
+		),
+		tb.PipelineTask("c-task", "c-task",
+			tb.PipelineTaskWhenExpression("$(tasks.a-task.results.aResult)", selection.In, []string{"missing"}),
+		),
+		tb.PipelineTask("d-task", "d-task", tb.RunAfter("c-task")),
+	))}
+	prs := []*v1beta1.PipelineRun{tb.PipelineRun("test-pipeline-run-different-service-accs", tb.PipelineRunNamespace("foo"),
+		tb.PipelineRunSpec("test-pipeline",
+			tb.PipelineRunServiceAccountName("test-sa-0"),
+		),
+	)}
+	ts := []*v1beta1.Task{
+		tb.Task("a-task", tb.TaskNamespace("foo")),
+		tb.Task("b-task", tb.TaskNamespace("foo")),
+		tb.Task("c-task", tb.TaskNamespace("foo")),
+		tb.Task("d-task", tb.TaskNamespace("foo")),
+	}
+	trs := []*v1beta1.TaskRun{
+		tb.TaskRun("test-pipeline-run-different-service-accs-a-task-xxyyy",
+			tb.TaskRunNamespace("foo"),
+			tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run-different-service-accs",
+				tb.OwnerReferenceAPIVersion("tekton.dev/v1beta1"),
+				tb.Controller, tb.BlockOwnerDeletion,
+			),
+			tb.TaskRunLabel("tekton.dev/pipeline", "test-pipeline"),
+			tb.TaskRunLabel("tekton.dev/pipelineRun", "test-pipeline-run-different-service-accs"),
+			tb.TaskRunLabel("tekton.dev/pipelineTask", "a-task"),
+			tb.TaskRunSpec(
+				tb.TaskRunTaskRef("hello-world"),
+				tb.TaskRunServiceAccountName("test-sa"),
+			),
+			tb.TaskRunStatus(
+				tb.StatusCondition(
+					apis.Condition{
+						Type:   apis.ConditionSucceeded,
+						Status: corev1.ConditionTrue,
+					},
+				),
+				tb.TaskRunResult("aResult", "aResultValue"),
+			),
+		),
+	}
+
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+		Tasks:        ts,
+		TaskRuns:     trs,
+	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
+
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 1 \\(Failed: 0, Cancelled 0\\), Incomplete: 1, Skipped: 2",
+	}
+	pipelineRun, clients := prt.reconcileRun("foo", "test-pipeline-run-different-service-accs", wantEvents, false)
+
+	expectedTaskRunName := "test-pipeline-run-different-service-accs-b-task-9l9zj"
+	expectedTaskRun := tb.TaskRun(expectedTaskRunName,
+		tb.TaskRunNamespace("foo"),
+		tb.TaskRunOwnerReference("PipelineRun", "test-pipeline-run-different-service-accs",
+			tb.OwnerReferenceAPIVersion("tekton.dev/v1beta1"),
+			tb.Controller, tb.BlockOwnerDeletion,
+		),
+		tb.TaskRunLabel("tekton.dev/pipeline", "test-pipeline"),
+		tb.TaskRunLabel("tekton.dev/pipelineRun", "test-pipeline-run-different-service-accs"),
+		tb.TaskRunLabel("tekton.dev/pipelineTask", "b-task"),
+		tb.TaskRunSpec(
+			tb.TaskRunTaskRef("b-task"),
+			tb.TaskRunServiceAccountName("test-sa-0"),
+		),
+	)
+	// Check that the expected TaskRun was created
+	actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+		LabelSelector: "tekton.dev/pipelineTask=b-task,tekton.dev/pipelineRun=test-pipeline-run-different-service-accs",
+		Limit:         1,
+	})
+
+	if err != nil {
+		t.Fatalf("Failure to list TaskRun's %s", err)
+	}
+	if len(actual.Items) != 1 {
+		t.Fatalf("Expected 1 TaskRuns got %d", len(actual.Items))
+	}
+	actualTaskRun := actual.Items[0]
+	if d := cmp.Diff(&actualTaskRun, expectedTaskRun, ignoreResourceVersion); d != "" {
+		t.Errorf("expected to see TaskRun %v created. Diff %s", expectedTaskRunName, diff.PrintWantGot(d))
+	}
+
+	actualWhenExpressionsInTaskRun := pipelineRun.Status.PipelineRunStatusFields.TaskRuns[expectedTaskRunName].WhenExpressions
+	expectedWhenExpressionsInTaskRun := []v1beta1.WhenExpression{{
+		Input:    "aResultValue",
+		Operator: "in",
+		Values:   []string{"aResultValue"},
+	}, {
+		Input:    "aResultValue",
+		Operator: "in",
+		Values:   []string{"aResultValue"},
+	}}
+	if d := cmp.Diff(expectedWhenExpressionsInTaskRun, actualWhenExpressionsInTaskRun); d != "" {
+		t.Errorf("expected to see When Expressions %v created. Diff %s", expectedTaskRunName, diff.PrintWantGot(d))
+	}
+
+	actualSkippedTasks := pipelineRun.Status.SkippedTasks
+	expectedSkippedTasks := []v1beta1.SkippedTask{{
+		Name: "c-task",
+		WhenExpressions: v1beta1.WhenExpressions{{
+			Input:    "aResultValue",
+			Operator: "in",
+			Values:   []string{"missing"},
+		}},
+	}, {
+		Name: "d-task",
+	}}
+	if d := cmp.Diff(actualSkippedTasks, expectedSkippedTasks); d != "" {
+		t.Errorf("expected to find Skipped Tasks %v. Diff %s", expectedSkippedTasks, diff.PrintWantGot(d))
+	}
+
+	skippedTasks := []string{"c-task", "d-task"}
+	for _, skippedTask := range skippedTasks {
+		labelSelector := fmt.Sprintf("tekton.dev/pipelineTask=%s,tekton.dev/pipelineRun=test-pipeline-run-different-service-accs", skippedTask)
+		actualSkippedTask, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+			Limit:         1,
+		})
+		if err != nil {
+			t.Fatalf("Failure to list TaskRun's %s", err)
+		}
+		if len(actualSkippedTask.Items) != 0 {
+			t.Fatalf("Expected 0 TaskRuns got %d", len(actualSkippedTask.Items))
+		}
 	}
 }
 
@@ -2203,22 +2321,10 @@ func TestReconcileWithAffinityAssistantStatefulSet(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling PipelineRun but saw %s", err)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get(pipelineRunName, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
-	}
+	reconciledRun, clients := prt.reconcileRun("foo", pipelineRunName, []string{}, false)
 
 	// Check that the expected StatefulSet was created
 	stsNames := make([]string, 0)
@@ -2247,7 +2353,7 @@ func TestReconcileWithAffinityAssistantStatefulSet(t *testing.T) {
 		}
 	}
 
-	taskRuns, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(metav1.ListOptions{})
+	taskRuns, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error when listing TaskRuns: %v", err)
 	}
@@ -2307,22 +2413,10 @@ func TestReconcileWithVolumeClaimTemplateWorkspace(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling PipelineRun but saw %s", err)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
-	}
+	reconciledRun, clients := prt.reconcileRun("foo", pipelineRunName, []string{}, false)
 
 	// Check that the expected PVC was created
 	pvcNames := make([]string, 0)
@@ -2339,12 +2433,12 @@ func TestReconcileWithVolumeClaimTemplateWorkspace(t *testing.T) {
 		t.Errorf("expected one PVC created. %d was created", len(pvcNames))
 	}
 
-	expectedPVCName := fmt.Sprintf("%s-%s-%s", claimName, workspaceName, pipelineRunName)
+	expectedPVCName := fmt.Sprintf("%s-%s", claimName, "cab465d09a")
 	if pvcNames[0] != expectedPVCName {
 		t.Errorf("expected the created PVC to be named %s. It was named %s", expectedPVCName, pvcNames[0])
 	}
 
-	taskRuns, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(metav1.ListOptions{})
+	taskRuns, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error when listing TaskRuns: %v", err)
 	}
@@ -2395,24 +2489,12 @@ func TestReconcileWithVolumeClaimTemplateWorkspaceUsingSubPaths(t *testing.T) {
 		Pipelines:    ps,
 		Tasks:        ts,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run", []string{}, false)
 
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling PipelineRun but saw %s", err)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
-	}
-
-	taskRuns, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(metav1.ListOptions{})
+	taskRuns, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error when listing TaskRuns: %v", err)
 	}
@@ -2526,25 +2608,18 @@ func TestReconcileWithTaskResults(t *testing.T) {
 			),
 		),
 	}
+
 	d := test.Data{
 		PipelineRuns: prs,
 		Pipelines:    ps,
 		Tasks:        ts,
 		TaskRuns:     trs,
 	}
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-different-service-accs")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
-	}
-	// Check that the PipelineRun was reconciled correctly
-	_, err = clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-different-service-accs", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
+
+	_, clients := prt.reconcileRun("foo", "test-pipeline-run-different-service-accs", []string{}, false)
+
 	expectedTaskRunName := "test-pipeline-run-different-service-accs-b-task-9l9zj"
 	expectedTaskRun := tb.TaskRun(expectedTaskRunName,
 		tb.TaskRunNamespace("foo"),
@@ -2562,7 +2637,7 @@ func TestReconcileWithTaskResults(t *testing.T) {
 		),
 	)
 	// Check that the expected TaskRun was created
-	actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(metav1.ListOptions{
+	actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{
 		LabelSelector: "tekton.dev/pipelineTask=b-task,tekton.dev/pipelineRun=test-pipeline-run-different-service-accs",
 		Limit:         1,
 	})
@@ -2606,23 +2681,15 @@ func TestReconcileWithTaskResultsEmbeddedNoneStarted(t *testing.T) {
 			),
 		),
 	}
+
 	d := test.Data{
 		PipelineRuns: prs,
 		Tasks:        ts,
 	}
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-different-service-accs")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
-	}
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-different-service-accs", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
+
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-different-service-accs", []string{}, false)
 
 	if !reconciledRun.Status.GetCondition(apis.ConditionSucceeded).IsUnknown() {
 		t.Errorf("Expected PipelineRun to be running, but condition status is %s", reconciledRun.Status.GetCondition(apis.ConditionSucceeded))
@@ -2645,7 +2712,7 @@ func TestReconcileWithTaskResultsEmbeddedNoneStarted(t *testing.T) {
 		),
 	)
 	// Check that the expected TaskRun was created (only)
-	actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(metav1.ListOptions{})
+	actual, err := clients.Pipeline.TektonV1beta1().TaskRuns("foo").List(prt.TestAssets.Ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failure to list TaskRun's %s", err)
 	}
@@ -2720,27 +2787,19 @@ func TestReconcileWithPipelineResults(t *testing.T) {
 			),
 		),
 	}
+
 	d := test.Data{
 		PipelineRuns: prs,
 		Pipelines:    ps,
 		Tasks:        ts,
 		TaskRuns:     trs,
 	}
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
-	err := c.Reconciler.Reconcile(context.Background(), "foo/test-pipeline-run-different-service-accs")
-	if err != nil {
-		t.Errorf("Did not expect to see error when reconciling completed PipelineRun but saw %s", err)
-	}
-	// Check that the PipelineRun was reconciled correctly
-	pipelineRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get("test-pipeline-run-different-service-accs", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
-	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	if d := cmp.Diff(&pipelineRun, &prs[0], ignoreResourceVersion); d != "" {
+	reconciledRun, _ := prt.reconcileRun("foo", "test-pipeline-run-different-service-accs", []string{}, false)
+
+	if d := cmp.Diff(&reconciledRun, &prs[0], ignoreResourceVersion); d != "" {
 		t.Errorf("expected to see pipeline run results created. Diff %s", diff.PrintWantGot(d))
 	}
 }
@@ -2934,6 +2993,7 @@ func TestReconcileOutOfSyncPipelineRun(t *testing.T) {
 			tbv1alpha1.ConditionSpecCheck("", "foo", tbv1alpha1.Args("bar")),
 		)),
 	}
+
 	d := test.Data{
 		PipelineRuns: prs,
 		Pipelines:    ps,
@@ -2941,22 +3001,17 @@ func TestReconcileOutOfSyncPipelineRun(t *testing.T) {
 		TaskRuns:     trs,
 		Conditions:   cs,
 	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
 
-	testAssets, cancel := getPipelineRunController(t, d)
-	defer cancel()
-	c := testAssets.Controller
-	clients := testAssets.Clients
+	reconciledRun, clients := prt.reconcileRun("foo", prOutOfSync.Name, []string{}, false)
 
-	if err := c.Reconciler.Reconcile(context.Background(), "foo/"+prOutOfSync.Name); err != nil {
-		t.Fatalf("Error reconciling: %s", err)
-	}
-
-	_, ok := clients.Pipeline.Actions()[2].(ktesting.UpdateAction).GetObject().(*v1beta1.PipelineRun)
-	if !ok {
-		t.Errorf("Expected a PipelineRun to be updated, but it wasn't.")
-	}
-	t.Log(clients.Pipeline.Actions())
 	actions := clients.Pipeline.Actions()
+	if len(actions) < 3 {
+		t.Fatalf("Expected client to have at least three action implementation but it has %d", len(actions))
+	}
+
+	_ = getPipelineRunUpdates(t, actions)
 	pipelineUpdates := 0
 	for _, action := range actions {
 		if action != nil {
@@ -2972,18 +3027,13 @@ func TestReconcileOutOfSyncPipelineRun(t *testing.T) {
 			}
 		}
 	}
+
 	// We actually expect three update calls because the first status update fails due to
 	// optimistic concurrency (due to the label update) and is retried after reloading via
 	// the client.
 	if got, want := pipelineUpdates, 3; got != want {
 		// If only the pipelinerun status changed, we expect one update
 		t.Fatalf("Expected client to have updated the pipelinerun %d times, but it did %d times", want, got)
-	}
-
-	// Check that the PipelineRun was reconciled correctly
-	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get(prOutOfSync.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Somehow had error getting completed reconciled run out of fake client: %s", err)
 	}
 
 	// This PipelineRun should still be running and the status should reflect that
@@ -3161,6 +3211,13 @@ func TestUpdatePipelineRunStatusFromTaskRuns(t *testing.T) {
 		},
 	}
 
+	prStatusWithEmptyTaskRuns := v1beta1.PipelineRunStatus{
+		Status: prRunningStatus,
+		PipelineRunStatusFields: v1beta1.PipelineRunStatusFields{
+			TaskRuns: nil,
+		},
+	}
+
 	prStatusWithOrphans := v1beta1.PipelineRunStatus{
 		Status: duckv1beta1.Status{
 			Conditions: []apis.Condition{
@@ -3199,6 +3256,18 @@ func TestUpdatePipelineRunStatusFromTaskRuns(t *testing.T) {
 					PipelineTaskName: "task-4",
 					Status:           nil,
 					ConditionChecks:  prccs4Recovered,
+				},
+			},
+		},
+	}
+
+	prStatusRecoveredSimple := v1beta1.PipelineRunStatus{
+		Status: prRunningStatus,
+		PipelineRunStatusFields: v1beta1.PipelineRunStatusFields{
+			TaskRuns: map[string]*v1beta1.PipelineRunTaskRunStatus{
+				"pr-task-1-xxyyy": {
+					PipelineTaskName: "task-1",
+					Status:           &v1beta1.TaskRunStatus{},
 				},
 			},
 		},
@@ -3269,6 +3338,20 @@ func TestUpdatePipelineRunStatusFromTaskRuns(t *testing.T) {
 			prStatus:         prStatusWithCondition,
 			trs:              nil,
 			expectedPrStatus: prStatusWithCondition,
+		}, {
+			prName:   "status-nil-taskruns",
+			prStatus: prStatusWithEmptyTaskRuns,
+			trs: []*v1beta1.TaskRun{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pr-task-1-xxyyy",
+						Labels: map[string]string{
+							pipeline.GroupName + pipeline.PipelineTaskLabelKey: "task-1",
+						},
+					},
+				},
+			},
+			expectedPrStatus: prStatusRecoveredSimple,
 		}, {
 			prName:   "status-missing-taskruns",
 			prStatus: prStatusWithCondition,
@@ -3643,22 +3726,29 @@ func TestReconcilePipeline_FinalTasks(t *testing.T) {
 				Tasks:        tt.ts,
 				TaskRuns:     tt.trs,
 			}
+			prt := NewPipelineRunTest(d, t)
+			defer prt.Cancel()
 
-			testAssets, cancel := getPipelineRunController(t, d)
-			defer cancel()
-			c := testAssets.Controller
-			clients := testAssets.Clients
+			reconciledRun, clients := prt.reconcileRun("foo", tt.pipelineRunName, []string{}, false)
 
-			if err := c.Reconciler.Reconcile(context.Background(), "foo/"+tt.pipelineRunName); err != nil {
-				t.Fatalf("Error reconciling for %s: %s", tt.name, err)
+			actions := clients.Pipeline.Actions()
+			if len(actions) < 2 {
+				t.Fatalf("Expected client to have at least two action implementation but it has %d", len(actions))
 			}
 
-			actual := clients.Pipeline.Actions()[1].(ktesting.UpdateAction).GetObject().(*v1beta1.PipelineRun)
+			// The first update action should be updating the PipelineRun.
+			var actual *v1beta1.PipelineRun
+			for _, action := range actions {
+				if actualPrime, ok := action.(ktesting.UpdateAction); ok {
+					actual = actualPrime.GetObject().(*v1beta1.PipelineRun)
+					break
+				}
+			}
+
 			if actual == nil {
 				t.Errorf("Expected a PipelineRun to be updated, but it wasn't for %s", tt.name)
 			}
 
-			actions := clients.Pipeline.Actions()
 			for _, action := range actions {
 				if action != nil {
 					resource := action.GetResource().Resource
@@ -3666,12 +3756,6 @@ func TestReconcilePipeline_FinalTasks(t *testing.T) {
 						t.Fatalf("Expected client to not have created a TaskRun for the PipelineRun, but it did for %s", tt.name)
 					}
 				}
-			}
-
-			// Check that the PipelineRun was reconciled correctly
-			reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns("foo").Get(tt.pipelineRunName, metav1.GetOptions{})
-			if err != nil {
-				t.Fatalf("Somehow had error getting completed reconciled run out of fake client for %s: %s", tt.name, err)
 			}
 
 			if tt.pipelineRunStatusFalse {
@@ -3752,4 +3836,360 @@ func getTaskRunStatus(t string, status corev1.ConditionStatus) *v1beta1.Pipeline
 			},
 		},
 	}
+}
+
+// TestReconcile_CloudEvents runs reconcile with a cloud event sink configured
+// to ensure that events are sent in different cases
+func TestReconcile_CloudEvents(t *testing.T) {
+	names.TestingSeed()
+
+	prs := []*v1beta1.PipelineRun{
+		tb.PipelineRun("test-pipelinerun",
+			tb.PipelineRunNamespace("foo"),
+			tb.PipelineRunSelfLink("/pipeline/1234"),
+			tb.PipelineRunSpec("test-pipeline"),
+		),
+	}
+	ps := []*v1beta1.Pipeline{
+		tb.Pipeline("test-pipeline",
+			tb.PipelineNamespace("foo"),
+			tb.PipelineSpec(tb.PipelineTask("test-1", "test-task")),
+		),
+	}
+	ts := []*v1beta1.Task{
+		tb.Task("test-task", tb.TaskNamespace("foo"),
+			tb.TaskSpec(tb.Step("foo", tb.StepName("simple-step"),
+				tb.StepCommand("/mycmd"), tb.StepEnvVar("foo", "bar"),
+			))),
+	}
+	cms := []*corev1.ConfigMap{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetDefaultsConfigName(), Namespace: system.GetNamespace()},
+			Data: map[string]string{
+				"default-cloud-events-sink": "http://synk:8080",
+			},
+		},
+	}
+
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+		Tasks:        ts,
+		ConfigMaps:   cms,
+	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
+
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 0",
+	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipelinerun", wantEvents, false)
+
+	// This PipelineRun is in progress now and the status should reflect that
+	condition := reconciledRun.Status.GetCondition(apis.ConditionSucceeded)
+	if condition == nil || condition.Status != corev1.ConditionUnknown {
+		t.Errorf("Expected PipelineRun status to be in progress, but was %v", condition)
+	}
+	if condition != nil && condition.Reason != v1beta1.PipelineRunReasonRunning.String() {
+		t.Errorf("Expected reason %q but was %s", v1beta1.PipelineRunReasonRunning.String(), condition.Reason)
+	}
+
+	if len(reconciledRun.Status.TaskRuns) != 1 {
+		t.Errorf("Expected PipelineRun status to include the TaskRun status items that can run immediately: %v", reconciledRun.Status.TaskRuns)
+	}
+
+	wantCloudEvents := []string{
+		`(?s)dev.tekton.event.pipelinerun.started.v1.*test-pipelinerun`,
+		`(?s)dev.tekton.event.pipelinerun.running.v1.*test-pipelinerun`,
+	}
+	ceClient := clients.CloudEvents.(cloudevent.FakeClient)
+	err := checkCloudEvents(t, &ceClient, "reconcile-cloud-events", wantCloudEvents)
+	if !(err == nil) {
+		t.Errorf(err.Error())
+	}
+}
+
+// this test validates taskSpec metadata is embedded into task run
+func TestReconcilePipeline_TaskSpecMetadata(t *testing.T) {
+	names.TestingSeed()
+
+	prs := []*v1beta1.PipelineRun{
+		tb.PipelineRun("test-pipeline-run-success",
+			tb.PipelineRunNamespace("foo"),
+			tb.PipelineRunSpec("test-pipeline"),
+		),
+	}
+
+	ts := v1beta1.TaskSpec{
+		Steps: []v1beta1.Step{{Container: corev1.Container{
+			Name:  "mystep",
+			Image: "myimage"}}},
+	}
+
+	labels := map[string]string{"label1": "labelvalue1", "label2": "labelvalue2"}
+	annotations := map[string]string{"annotation1": "value1", "annotation2": "value2"}
+
+	ps := []*v1beta1.Pipeline{
+		tb.Pipeline("test-pipeline",
+			tb.PipelineNamespace("foo"),
+			tb.PipelineSpec(
+				tb.PipelineTask("task-without-metadata", "", tb.PipelineTaskSpec(ts)),
+				tb.PipelineTask("task-with-metadata", "", tb.PipelineTaskSpec(ts),
+					tb.TaskSpecMetadata(v1beta1.PipelineTaskMetadata{
+						Labels:      labels,
+						Annotations: annotations}),
+				),
+			),
+		),
+	}
+
+	d := test.Data{
+		PipelineRuns: prs,
+		Pipelines:    ps,
+	}
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
+
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-success", []string{}, false)
+
+	actions := clients.Pipeline.Actions()
+	if len(actions) == 0 {
+		t.Fatalf("Expected client to have been used to create a TaskRun but it wasn't")
+	}
+
+	actualTaskRun := make(map[string]*v1beta1.TaskRun)
+	for _, a := range actions {
+		if a.GetResource().Resource == "taskruns" {
+			t := a.(ktesting.CreateAction).GetObject().(*v1beta1.TaskRun)
+			actualTaskRun[t.Name] = t
+		}
+	}
+
+	// Check that the expected TaskRun was created
+	if len(actualTaskRun) != 2 {
+		t.Errorf("Expected two TaskRuns to be created, but found %d TaskRuns.", len(actualTaskRun))
+	}
+
+	expectedTaskRun := make(map[string]*v1beta1.TaskRun)
+	expectedTaskRun["test-pipeline-run-success-task-with-metadata-mz4c7"] = getTaskRunWithTaskSpec(
+		"test-pipeline-run-success-task-with-metadata-mz4c7",
+		"test-pipeline-run-success",
+		"test-pipeline",
+		"task-with-metadata",
+		labels,
+		annotations,
+	)
+
+	expectedTaskRun["test-pipeline-run-success-task-without-metadata-9l9zj"] = getTaskRunWithTaskSpec(
+		"test-pipeline-run-success-task-without-metadata-9l9zj",
+		"test-pipeline-run-success",
+		"test-pipeline",
+		"task-without-metadata",
+		map[string]string{},
+		map[string]string{},
+	)
+
+	if d := cmp.Diff(actualTaskRun, expectedTaskRun); d != "" {
+		t.Fatalf("Expected TaskRuns to match, but got a mismatch: %s", d)
+	}
+
+	if len(reconciledRun.Status.TaskRuns) != 2 {
+		t.Errorf("Expected PipelineRun status to include both TaskRun status items that can run immediately: %v", reconciledRun.Status.TaskRuns)
+	}
+}
+
+// NewPipelineRunTest returns PipelineRunTest with a new PipelineRun controller created with specified state through data
+// This PipelineRunTest can be reused for multiple PipelineRuns by calling reconcileRun for each pipelineRun
+func NewPipelineRunTest(data test.Data, t *testing.T) *PipelineRunTest {
+	t.Helper()
+	testAssets, cancel := getPipelineRunController(t, data)
+	return &PipelineRunTest{
+		Data:       data,
+		Test:       t,
+		TestAssets: testAssets,
+		Cancel:     cancel,
+	}
+}
+
+func (prt PipelineRunTest) reconcileRun(namespace, pipelineRunName string, wantEvents []string, permanentError bool) (*v1beta1.PipelineRun, test.Clients) {
+	prt.Test.Helper()
+	c := prt.TestAssets.Controller
+	clients := prt.TestAssets.Clients
+
+	reconcileError := c.Reconciler.Reconcile(prt.TestAssets.Ctx, namespace+"/"+pipelineRunName)
+	if permanentError {
+		// When a PipelineRun is invalid and can't run, we expect a permanent error that will
+		// tell the Reconciler to not keep trying to reconcile.
+		if reconcileError == nil {
+			prt.Test.Fatalf("Expected an error to be returned by Reconcile, got nil instead")
+		}
+		if controller.IsPermanentError(reconcileError) != permanentError {
+			prt.Test.Fatalf("Expected the error to be permanent: %v but got: %v", permanentError, controller.IsPermanentError(reconcileError))
+		}
+	} else if reconcileError != nil {
+		prt.Test.Fatalf("Error reconciling: %s", reconcileError)
+	}
+	// Check that the PipelineRun was reconciled correctly
+	reconciledRun, err := clients.Pipeline.TektonV1beta1().PipelineRuns(namespace).Get(prt.TestAssets.Ctx, pipelineRunName, metav1.GetOptions{})
+	if err != nil {
+		prt.Test.Fatalf("Somehow had error getting reconciled run out of fake client: %s", err)
+	}
+
+	// Check generated events match what's expected
+	if len(wantEvents) > 0 {
+		if err := checkEvents(prt.Test, prt.TestAssets.Recorder, pipelineRunName, wantEvents); err != nil {
+			prt.Test.Errorf(err.Error())
+		}
+	}
+
+	return reconciledRun, clients
+}
+
+func TestReconcile_RemotePipelineRef(t *testing.T) {
+	names.TestingSeed()
+
+	ctx := context.Background()
+	cfg := config.NewStore(logtesting.TestLogger(t))
+	cfg.OnConfigChanged(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: config.GetFeatureFlagsConfigName()},
+		Data: map[string]string{
+			"enable-tekton-oci-bundles": "true",
+		},
+	})
+	ctx = cfg.ToContext(ctx)
+
+	// Set up a fake registry to push an image to.
+	s := httptest.NewServer(registry.New())
+	defer s.Close()
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ref := u.Host + "/testreconcile_remotepipelineref"
+
+	prs := []*v1beta1.PipelineRun{{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline-run-success", Namespace: "foo"},
+		Spec: v1beta1.PipelineRunSpec{
+			ServiceAccountName: "test-sa",
+			PipelineRef:        &v1beta1.PipelineRef{Name: "test-pipeline", Bundle: ref},
+			Timeout:            &metav1.Duration{Duration: config.DefaultTimeoutMinutes * time.Minute},
+		},
+	}}
+	ps := &v1beta1.Pipeline{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "tekton.dev/v1beta1", Kind: "Pipeline"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pipeline", Namespace: "foo"},
+		Spec: v1beta1.PipelineSpec{
+			Tasks: []v1beta1.PipelineTask{{
+				Name:    "unit-test-1",
+				TaskRef: &v1beta1.TaskRef{Name: "unit-test-task", Bundle: ref}},
+			},
+		},
+	}
+	cms := []*corev1.ConfigMap{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: config.GetFeatureFlagsConfigName(), Namespace: system.GetNamespace()},
+			Data: map[string]string{
+				"enable-tekton-oci-bundles": "true",
+			},
+		},
+	}
+
+	// This task will be uploaded along with the pipeline definition.
+	remoteTask := tb.Task("unit-test-task", tb.TaskType, tb.TaskSpec(), tb.TaskNamespace("foo"))
+
+	// Create a bundle from our pipeline and tasks.
+	if _, err := test.CreateImage(ref, ps, remoteTask); err != nil {
+		t.Fatalf("failed to create image in pipeline renconcile: %s", err.Error())
+	}
+
+	// Unlike the tests above, we do *not* locally define our pipeline or unit-test task.
+	d := test.Data{
+		PipelineRuns: prs,
+		ServiceAccounts: []*corev1.ServiceAccount{{
+			ObjectMeta: metav1.ObjectMeta{Name: prs[0].Spec.ServiceAccountName, Namespace: "foo"},
+		}},
+		ConfigMaps: cms,
+	}
+
+	prt := NewPipelineRunTest(d, t)
+	defer prt.Cancel()
+
+	wantEvents := []string{
+		"Normal Started",
+		"Normal Running Tasks Completed: 0",
+	}
+	reconciledRun, clients := prt.reconcileRun("foo", "test-pipeline-run-success", wantEvents, false)
+
+	if len(clients.Pipeline.Actions()) == 0 {
+		t.Fatalf("Expected client to have been used to create a TaskRun but it wasn't")
+	}
+
+	// Check that the expected TaskRun was created
+	actual := getTaskRunCreations(t, clients.Pipeline.Actions())[0]
+	expectedTaskRun := &v1beta1.TaskRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-pipeline-run-success-unit-test-1-9l9zj",
+			Namespace:   "foo",
+			Annotations: map[string]string{},
+			Labels: map[string]string{
+				"tekton.dev/pipeline":                              "test-pipeline",
+				"tekton.dev/pipelineRun":                           "test-pipeline-run-success",
+				pipeline.GroupName + pipeline.PipelineTaskLabelKey: "unit-test-1",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         "tekton.dev/v1beta1",
+				Kind:               "PipelineRun",
+				Name:               "test-pipeline-run-success",
+				Controller:         &trueb,
+				BlockOwnerDeletion: &trueb,
+			}},
+		},
+		Spec: v1beta1.TaskRunSpec{
+			ServiceAccountName: "test-sa",
+			Resources:          &v1beta1.TaskRunResources{},
+			Timeout:            &metav1.Duration{Duration: config.DefaultTimeoutMinutes * time.Minute},
+			TaskRef: &v1beta1.TaskRef{
+				Name:   "unit-test-task",
+				Bundle: ref,
+			},
+		},
+	}
+
+	if d := cmp.Diff(expectedTaskRun, actual, cmpopts.SortSlices(func(x, y v1beta1.TaskResourceBinding) bool { return x.Name < y.Name })); d != "" {
+		t.Errorf("expected to see TaskRun %v created. Diff %s", expectedTaskRun, diff.PrintWantGot(d))
+	}
+
+	// This PipelineRun is in progress now and the status should reflect that
+	condition := reconciledRun.Status.GetCondition(apis.ConditionSucceeded)
+	if condition == nil || condition.Status != corev1.ConditionUnknown {
+		t.Errorf("Expected PipelineRun status to be in progress, but was %v", condition)
+	}
+	if condition != nil && condition.Reason != v1beta1.PipelineRunReasonRunning.String() {
+		t.Errorf("Expected reason %q but was %s", v1beta1.PipelineRunReasonRunning.String(), condition.Reason)
+	}
+
+	if len(reconciledRun.Status.TaskRuns) != 1 {
+		t.Errorf("Expected PipelineRun status to include the TaskRun status item that ran immediately: %v", reconciledRun.Status.TaskRuns)
+	}
+	if _, exists := reconciledRun.Status.TaskRuns["test-pipeline-run-success-unit-test-1-9l9zj"]; !exists {
+		t.Errorf("Expected PipelineRun status to include TaskRun status but was %v", reconciledRun.Status.TaskRuns)
+	}
+}
+
+func getTaskRunWithTaskSpec(tr, pr, p, t string, labels, annotations map[string]string) *v1beta1.TaskRun {
+	return tb.TaskRun(tr,
+		tb.TaskRunNamespace("foo"),
+		tb.TaskRunOwnerReference("PipelineRun", pr,
+			tb.OwnerReferenceAPIVersion("tekton.dev/v1beta1"),
+			tb.Controller, tb.BlockOwnerDeletion),
+		tb.TaskRunLabel(pipeline.GroupName+pipeline.PipelineLabelKey, p),
+		tb.TaskRunLabel(pipeline.GroupName+pipeline.PipelineRunLabelKey, pr),
+		tb.TaskRunLabel(pipeline.GroupName+pipeline.PipelineTaskLabelKey, t),
+		tb.TaskRunLabels(labels),
+		tb.TaskRunAnnotations(annotations),
+		tb.TaskRunSpec(tb.TaskRunTaskSpec(tb.Step("myimage", tb.StepName("mystep"))),
+			tb.TaskRunServiceAccountName(config.DefaultServiceAccountValue),
+		))
 }

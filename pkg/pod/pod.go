@@ -44,8 +44,7 @@ const (
 
 // These are effectively const, but Go doesn't have such an annotation.
 var (
-	ReleaseAnnotation      = "pipeline.tekton.dev/release"
-	ReleaseAnnotationValue = version.PipelineVersion
+	ReleaseAnnotation = "pipeline.tekton.dev/release"
 
 	groupVersionKind = schema.GroupVersionKind{
 		Group:   v1beta1.SchemeGroupVersion.Group,
@@ -75,9 +74,18 @@ var (
 	}}
 )
 
-// MakePod converts TaskRun and TaskSpec objects to a Pod which implements the taskrun specified
-// by the supplied CRD.
-func MakePod(ctx context.Context, images pipeline.Images, taskRun *v1beta1.TaskRun, taskSpec v1beta1.TaskSpec, kubeclient kubernetes.Interface, entrypointCache EntrypointCache, overrideHomeEnv bool) (*corev1.Pod, error) {
+// Builder exposes options to configure Pod construction from TaskSpecs/Runs.
+type Builder struct {
+	Images          pipeline.Images
+	KubeClient      kubernetes.Interface
+	EntrypointCache EntrypointCache
+	OverrideHomeEnv bool
+}
+
+// Build creates a Pod using the configuration options set on b and the TaskRun
+// and TaskSpec provided in its arguments. An error is returned if there are
+// any problems during the conversion.
+func (b *Builder) Build(ctx context.Context, taskRun *v1beta1.TaskRun, taskSpec v1beta1.TaskSpec) (*corev1.Pod, error) {
 	var initContainers []corev1.Container
 	var volumes []corev1.Volume
 	var volumeMounts []corev1.VolumeMount
@@ -87,7 +95,7 @@ func MakePod(ctx context.Context, images pipeline.Images, taskRun *v1beta1.TaskR
 	volumes = append(volumes, implicitVolumes...)
 	volumeMounts = append(volumeMounts, implicitVolumeMounts...)
 
-	if overrideHomeEnv {
+	if b.OverrideHomeEnv {
 		implicitEnvVars = append(implicitEnvVars, corev1.EnvVar{
 			Name:  "HOME",
 			Value: homeDir,
@@ -97,7 +105,7 @@ func MakePod(ctx context.Context, images pipeline.Images, taskRun *v1beta1.TaskR
 	// Create Volumes and VolumeMounts for any credentials found in annotated
 	// Secrets, along with any arguments needed by Step entrypoints to process
 	// those secrets.
-	credEntrypointArgs, credVolumes, credVolumeMounts, err := credsInit(taskRun.Spec.ServiceAccountName, taskRun.Namespace, kubeclient)
+	credEntrypointArgs, credVolumes, credVolumeMounts, err := credsInit(ctx, taskRun.Spec.ServiceAccountName, taskRun.Namespace, b.KubeClient)
 	if err != nil {
 		return nil, err
 	}
@@ -113,33 +121,34 @@ func MakePod(ctx context.Context, images pipeline.Images, taskRun *v1beta1.TaskR
 
 	// Convert any steps with Script to command+args.
 	// If any are found, append an init container to initialize scripts.
-	scriptsInit, stepContainers, sidecarContainers := convertScripts(images.ShellImage, steps, taskSpec.Sidecars)
+	scriptsInit, stepContainers, sidecarContainers := convertScripts(b.Images.ShellImage, steps, taskSpec.Sidecars)
 	if scriptsInit != nil {
 		initContainers = append(initContainers, *scriptsInit)
 		volumes = append(volumes, scriptsVolume)
 	}
 
 	// Initialize any workingDirs under /workspace.
-	if workingDirInit := workingDirInit(images.ShellImage, stepContainers); workingDirInit != nil {
+	if workingDirInit := workingDirInit(b.Images.ShellImage, stepContainers); workingDirInit != nil {
 		initContainers = append(initContainers, *workingDirInit)
 	}
 
 	// Resolve entrypoint for any steps that don't specify command.
-	stepContainers, err = resolveEntrypoints(entrypointCache, taskRun.Namespace, taskRun.Spec.ServiceAccountName, stepContainers)
+	stepContainers, err = resolveEntrypoints(ctx, b.EntrypointCache, taskRun.Namespace, taskRun.Spec.ServiceAccountName, stepContainers)
 	if err != nil {
 		return nil, err
 	}
 
 	// Rewrite steps with entrypoint binary. Append the entrypoint init
-	// container to place the entrypoint binary.
-	entrypointInit, stepContainers, err := orderContainers(images.EntrypointImage, credEntrypointArgs, stepContainers, taskSpec.Results)
+	// container to place the entrypoint binary. Also add timeout flags
+	// to entrypoint binary.
+	entrypointInit, stepContainers, err := orderContainers(b.Images.EntrypointImage, credEntrypointArgs, stepContainers, &taskSpec)
 	if err != nil {
 		return nil, err
 	}
 	initContainers = append(initContainers, entrypointInit)
 	volumes = append(volumes, toolsVolume, downwardVolume)
 
-	limitRangeMin, err := getLimitRangeMinimum(taskRun.Namespace, kubeclient)
+	limitRangeMin, err := getLimitRangeMinimum(ctx, taskRun.Namespace, b.KubeClient)
 	if err != nil {
 		return nil, err
 	}
@@ -160,10 +169,14 @@ func MakePod(ctx context.Context, images pipeline.Images, taskRun *v1beta1.TaskR
 	for i, s := range stepContainers {
 		// Mount /tekton/creds with a fresh volume for each Step. It needs to
 		// be world-writeable and empty so creds can be initialized in there. Cant
-		// guarantee what UID container runs with.
-		v, vm := getCredsInitVolume()
-		volumes = append(volumes, v)
-		s.VolumeMounts = append(s.VolumeMounts, vm)
+		// guarantee what UID container runs with. If creds-init is disabled via
+		// feature flag then these can be nil since we don't want to mount the
+		// automatic credential volume.
+		v, vm := getCredsInitVolume(ctx)
+		if v != nil && vm != nil {
+			volumes = append(volumes, *v)
+			s.VolumeMounts = append(s.VolumeMounts, *vm)
+		}
 
 		requestedVolumeMounts := map[string]bool{}
 		for _, vm := range s.VolumeMounts {
@@ -241,7 +254,7 @@ func MakePod(ctx context.Context, images pipeline.Images, taskRun *v1beta1.TaskR
 	}
 
 	podAnnotations := taskRun.Annotations
-	podAnnotations[ReleaseAnnotation] = ReleaseAnnotationValue
+	podAnnotations[ReleaseAnnotation] = version.PipelineVersion
 
 	if shouldAddReadyAnnotationOnPodCreate(ctx, taskSpec.Sidecars) {
 		podAnnotations[readyAnnotation] = readyAnnotationValue
@@ -328,8 +341,8 @@ func nodeAffinityUsingAffinityAssistant(affinityAssistantName string) *corev1.Af
 // https://github.com/kubernetes/kubernetes/issues/79496, the
 // max LimitRange minimum must be found in the event of conflicting
 // container minimums specified.
-func getLimitRangeMinimum(namespace string, kubeclient kubernetes.Interface) (corev1.ResourceList, error) {
-	limitRanges, err := kubeclient.CoreV1().LimitRanges(namespace).List(metav1.ListOptions{})
+func getLimitRangeMinimum(ctx context.Context, namespace string, kubeclient kubernetes.Interface) (corev1.ResourceList, error) {
+	limitRanges, err := kubeclient.CoreV1().LimitRanges(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}

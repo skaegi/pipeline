@@ -5,12 +5,21 @@ This guide explains how to install Tekton Pipelines. It covers the following top
 * [Before you begin](#before-you-begin)
 * [Installing Tekton Pipelines on Kubernetes](#installing-tekton-pipelines-on-kubernetes)
 * [Installing Tekton Pipelines on OpenShift](#installing-tekton-pipelines-on-openshift)
-* [Configuring artifact storage](#configuring-artifact-storage)
+* [Configuring PipelineResource storage](#configuring-pipelineresource-storage)
 * [Customizing basic execution parameters](#customizing-basic-execution-parameters)
 * [Creating a custom release of Tekton Pipelines](#creating-a-custom-release-of-tekton-pipelines)
 * [Next steps](#next-steps)
 
 ## Before you begin
+
+1. You must have a Kubernetes cluster running version 1.16 or later.
+
+   If you don't already have a cluster, you can create one for testing with `kind`.
+   [Install `kind`](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) and create a cluster by running [`kind create cluster`](https://kind.sigs.k8s.io/docs/user/quick-start/#creating-a-cluster). This
+   will create a cluster running locally, with RBAC enabled and your user granted
+   the `cluster-admin` role.
+
+1. If you want to support high availability usecases, install a [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) on your cluster. 
 
 1. Choose the version of Tekton Pipelines you want to install. You have the following options:
 
@@ -21,21 +30,7 @@ This guide explains how to install Tekton Pipelines. It covers the following top
    * **[`HEAD`]** - this is the bleeding edge. It contains unreleased code that may result
      in unpredictable behavior. To get started, see the [development guide](https://github.com/tektoncd/pipeline/blob/master/DEVELOPMENT.md) instead of this page.
 
-2. If you don't have an existing Kubernetes cluster, set one up, version 1.16 or later:
-
-   ```bash
-   #Example command for creating a cluster on GKE
-   gcloud container clusters create $CLUSTER_NAME \
-     --zone=$CLUSTER_ZONE --cluster-version=1.16.9-gke.6
-   ```
-
-3. Grant `cluster-admin` permissions to the current user:
-
-   ```bash
-   kubectl create clusterrolebinding cluster-admin-binding \
-   --clusterrole=cluster-admin \
-   --user=$(gcloud config get-value core/account)
-   ```
+1. Grant `cluster-admin` permissions to the current user.
 
    See [Role-based access control](https://cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control#prerequisites_for_using_role-based_access_control)
    for more information.
@@ -49,6 +44,13 @@ To install Tekton Pipelines on a Kubernetes cluster:
    ```bash
    kubectl apply --filename https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
    ```
+
+   Or, for the nightly release, use:
+
+   ```bash
+   kubectl apply --filename https://storage.googleapis.com/tekton-releases-nightly/pipeline/latest/release.yaml
+   ```
+
    You can install a specific release using `previous/$VERSION_NUMBER`. For example:
 
    ```bash
@@ -72,7 +74,7 @@ To install Tekton Pipelines on a Kubernetes cluster:
 
 Congratulations! You have successfully installed Tekton Pipelines on your Kubernetes cluster. Next, see the following topics:
 
-* [Configuring artifact storage](#configuring-artifact-storage) to set up artifact storage for Tekton Pipelines.
+* [Configuring PipelineResource storage](#configuring-pipelineresource-storage) to set up artifact storage for Tekton Pipelines.
 * [Customizing basic execution parameters](#customizing-basic-execution-parameters) if you need to customize your service account, timeout, or Pod template values.
 
 ### Installing Tekton Pipelines on OpenShift
@@ -96,6 +98,7 @@ for more information.
    ```bash
    oc new-project tekton-pipelines
    oc adm policy add-scc-to-user anyuid -z tekton-pipelines-controller
+   oc adm policy add-scc-to-user anyuid -z tekton-pipelines-webhook
    ```
 1. Install Tekton Pipelines:
 
@@ -116,21 +119,28 @@ for more information.
 
 Congratulations! You have successfully installed Tekton Pipelines on your OpenShift environment. Next, see the following topics:
 
-* [Configuring artifact storage](#configuring-artifact-storage) to set up artifact storage for Tekton Pipelines.
+* [Configuring PipelineResource storage](#configuring-pipelineresource-storage) to set up artifact storage for Tekton Pipelines.
 * [Customizing basic execution parameters](#customizing-basic-execution-parameters) if you need to customize your service account, timeout, or Pod template values.
 
 If you want to run OpenShift 4.x on your laptop (or desktop), you
 should take a look at [Red Hat CodeReady Containers](https://github.com/code-ready/crc).
 
-## Configuring artifact storage
+## Configuring PipelineResource storage
 
-`Tasks` in Tekton Pipelines need to ingest inputs from and store outputs to one or more common locations.
- You can use one of the following solutions to set up resource storage for Tekton Pipelines:
+PipelineResources are one of the ways that Tekton passes data between Tasks. If you intend to
+use PipelineResources in your Pipelines then you'll need to configure a storage location
+for that data to be put so that it can be shared between Tasks in the Pipeline.
+
+**Note:** Pipeline Resources are in alpha and are currently undergoing considerable redesign. Therefore
+this storage configuration is possibly going to change in future. Writing Tasks and Pipelines today that rely
+on this feature may mean you'll need to rewrite those Tasks and Pipelines when the redesign is complete. See
+the [explanation for the redesign in the PipelineResources doc](./resources.md#why-arent-pipelineresources-in-beta)
+and [issue 1673](https://github.com/tektoncd/pipeline/issues/1673) to follow along with the redesign work.
+
+The storage options available for sharing PipelineResources between Tasks in a Pipeline are:
 
   * [A persistent volume](#configuring-a-persistent-volume)
   * [A cloud storage bucket](#configuring-a-cloud-storage-bucket)
-
-**Note:** Inputs and output locations for `Tasks` are defined via [`PipelineResources`](https://github.com/tektoncd/pipeline/blob/master/docs/resources.md).
 
 Either option provides the same functionality to Tekton Pipelines. Choose the option that
 best suits your business needs. For example:
@@ -239,7 +249,7 @@ data:
 
 When configured so, Tekton can generate `CloudEvents` for `TaskRun` and `PipelineRun` lifecycle
 events. The only configuration parameter is the URL of the sink. When not set, no notification is
-generared.
+generated.
 
 ```
 apiVersion: v1
@@ -254,6 +264,10 @@ data:
   default-cloud-events-sink: https://my-sink-url
 ```
 
+## Configuring self-signed cert for private registry
+
+The `SSL_CERT_DIR` is set to `/etc/ssl/certs` as the default cert directory. If you are using a self-signed cert for private registry and the cert file is not under the default cert directory, configure your registry cert in the `config-registry-cert` `ConfigMap` with the key `cert`.
+
 ## Customizing basic execution parameters
 
 You can specify your own values that replace the default service account (`ServiceAccount`), timeout (`Timeout`), and Pod template (`PodTemplate`) values used by Tekton Pipelines in `TaskRun` and `PipelineRun` definitions. To do so, modify the ConfigMap `config-defaults` with your desired values.
@@ -263,8 +277,9 @@ The example below customizes the following:
 - the default service account from `default` to `tekton`.
 - the default timeout from 60 minutes to 20 minutes.
 - the default `app.kubernetes.io/managed-by` label is applied to all Pods created to execute `TaskRuns`.
-- the default Pod template to include a node selector to select the node where the Pod will be scheduled by default.
+- the default Pod template to include a node selector to select the node where the Pod will be scheduled by default. A list of supported fields is available [here](https://github.com/tektoncd/pipeline/blob/master/docs/podtemplates.md#supported-fields).
   For more information, see [`PodTemplate` in `TaskRuns`](./taskruns.md#specifying-a-pod-template) or [`PodTemplate` in `PipelineRuns`](./pipelineruns.md#specifying-a-pod-template).
+- the default `Workspace` configuration can be set for any `Workspaces` that a Task declares but that a TaskRun does not explicitly provide
 
 ```yaml
 apiVersion: v1
@@ -278,6 +293,8 @@ data:
     nodeSelector:
       kops.k8s.io/instancegroup: build-instance-group
   default-managed-by-label-value: "my-tekton-installation"
+  default-task-run-workspace-binding: |
+    emptyDir: {}
 ```
 
 **Note:** The `_example` key in the provided [config-defaults.yaml](./../config/config-defaults.yaml)
@@ -288,7 +305,7 @@ file lists the keys you can customize along with their default values.
 To customize the behavior of the Pipelines Controller, modify the ConfigMap `feature-flags` as follows:
 
 - `disable-affinity-assistant` - set this flag to `true` to disable the [Affinity Assistant](./workspaces.md#specifying-workspace-order-in-a-pipeline-and-affinity-assistants)
-  that is used to provide Node Affinity for `TaskRun` pods that share workspace volume. 
+  that is used to provide Node Affinity for `TaskRun` pods that share workspace volume.
   The Affinity Assistant is incompatible with other affinity rules
   configured for `TaskRun` pods.
 
@@ -311,10 +328,24 @@ for each `Step` that does not have its working directory explicitly set with `/w
 For more information, see the [associated issue](https://github.com/tektoncd/pipeline/issues/1836).
 
 - `running-in-environment-with-injected-sidecars`: set this flag to `"true"` to allow the
-Tekton controller to set the `tekton.dev/ready` annotation at pod creation time for 
+Tekton controller to set the `tekton.dev/ready` annotation at pod creation time for
 TaskRuns with no Sidecars specified. Enabling this option should decrease the time it takes for a TaskRun to
 start running. However, for clusters that use injected sidecars e.g. istio
 enabling this option can lead to unexpected behavior.
+
+- `require-git-ssh-secret-known-hosts`: set this flag to `"true"` to require that
+Git SSH Secrets include a `known_hosts` field. This ensures that a git remote server's
+key is validated before data is accepted from it when authenticating over SSH. Secrets
+that don't include a `known_hosts` will result in the TaskRun failing validation and
+not running.
+
+- `enable-tekton-oci-bundles`: set this flag to `"true"` to enable the
+  tekton OCI bundle usage (see [the tekton bundle
+  contract](./tekton-bundle-contracts.md)). Enabling this option
+  allows the use of `bundle` field in `taskRef` and `pipelineRef` for
+  `Pipeline`, `PipelineRun` and `TaskRun`. By default, this option is
+  disabled (`"false"`), which means it is disallowed to use the
+  `bundle` field.
 
 For example:
 
@@ -328,9 +359,19 @@ data:
   disable-working-directory-overwrite: "true" # Tekton will not override the working directory for individual Steps.
 ```
 
+### Customizing High Availability for the Pipelines Controller
+
+To customize the behavior of HA for the Tekton Pipelines controller, please refer to the related [documentation](developers/enabling-ha.md).
+
 ## Creating a custom release of Tekton Pipelines
 
 You can create a custom release of Tekton Pipelines by following and customizing the steps in [Creating an official release](https://github.com/tektoncd/pipeline/blob/master/tekton/README.md#create-an-official-release). For example, you might want to customize the container images built and used by Tekton Pipelines.
+
+## Configuring High Availability
+
+If you want to run Tekton Pipelines in a way so that webhooks are resiliant against failures and support high concurrency scenarios, you need to run a [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) in your Kubernetes cluster. This is required by the [Horizontal Pod Autoscalers](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) to compute the replica count. 
+
+**Note:** The default configuration is defined in [webhook-hpa.yaml](./../config/webhook-hpa.yaml) which could be customized to better fit a  specific usecase.
 
 ## Next steps
 

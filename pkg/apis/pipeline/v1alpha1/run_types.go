@@ -23,7 +23,9 @@ import (
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	v1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/json"
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 )
@@ -44,12 +46,24 @@ type RunSpec struct {
 	// +optional
 	Params []v1beta1.Param `json:"params,omitempty"`
 
+	// Used for cancelling a run (and maybe more later on)
+	// +optional
+	Status RunSpecStatus `json:"status,omitempty"`
+
 	// TODO(https://github.com/tektoncd/community/pull/128)
-	// - cancellation
 	// - timeout
 	// - inline task spec
 	// - workspaces ?
 }
+
+// RunSpecStatus defines the taskrun spec status the user can provide
+type RunSpecStatus string
+
+const (
+	// RunSpecStatusCancelled indicates that the user wants to cancel the run,
+	// if not already cancelled or terminated
+	RunSpecStatusCancelled RunSpecStatus = "RunCancelled"
+)
 
 // TODO(jasonhall): Move this to a Params type so other code can use it?
 func (rs RunSpec) GetParam(name string) *v1beta1.Param {
@@ -101,6 +115,45 @@ func (r *RunStatus) SetCondition(newCond *apis.Condition) {
 	}
 }
 
+// MarkRunSucceeded changes the Succeeded condition to True with the provided reason and message.
+func (r *RunStatus) MarkRunSucceeded(reason, messageFormat string, messageA ...interface{}) {
+	runCondSet.Manage(r).MarkTrueWithReason(apis.ConditionSucceeded, reason, messageFormat, messageA...)
+	succeeded := r.GetCondition(apis.ConditionSucceeded)
+	r.CompletionTime = &succeeded.LastTransitionTime.Inner
+}
+
+// MarkRunFailed changes the Succeeded condition to False with the provided reason and message.
+func (r *RunStatus) MarkRunFailed(reason, messageFormat string, messageA ...interface{}) {
+	runCondSet.Manage(r).MarkFalse(apis.ConditionSucceeded, reason, messageFormat, messageA...)
+	succeeded := r.GetCondition(apis.ConditionSucceeded)
+	r.CompletionTime = &succeeded.LastTransitionTime.Inner
+}
+
+// MarkRunRunning changes the Succeeded condition to Unknown with the provided reason and message.
+func (r *RunStatus) MarkRunRunning(reason, messageFormat string, messageA ...interface{}) {
+	runCondSet.Manage(r).MarkUnknown(apis.ConditionSucceeded, reason, messageFormat, messageA...)
+}
+
+// DecodeExtraFields deserializes the extra fields in the Run status.
+func (r *RunStatus) DecodeExtraFields(into interface{}) error {
+	if len(r.ExtraFields.Raw) == 0 {
+		return nil
+	}
+	return json.Unmarshal(r.ExtraFields.Raw, into)
+}
+
+// EncodeExtraFields serializes the extra fields in the Run status.
+func (r *RunStatus) EncodeExtraFields(from interface{}) error {
+	data, err := json.Marshal(from)
+	if err != nil {
+		return err
+	}
+	r.ExtraFields = runtime.RawExtension{
+		Raw: data,
+	}
+	return nil
+}
+
 // GetConditionSet retrieves the condition set for this resource. Implements
 // the KRShaped interface.
 func (r *Run) GetConditionSet() apis.ConditionSet { return runCondSet }
@@ -126,8 +179,9 @@ type RunStatusFields struct {
 	// +optional
 	Results []v1beta1.TaskRunResult `json:"results,omitempty"`
 
-	// TODO(jasonhall): Add a field to hold additional arbitrary fields as
-	// a map[string]interface{}.
+	// ExtraFields holds arbitrary fields provided by the custom task
+	// controller.
+	ExtraFields runtime.RawExtension `json:"extraFields,omitempty"`
 }
 
 // +genclient
@@ -172,6 +226,11 @@ func (r *Run) HasPipelineRunOwnerReference() bool {
 		}
 	}
 	return false
+}
+
+// IsCancelled returns true if the Run's spec status is set to Cancelled state
+func (r *Run) IsCancelled() bool {
+	return r.Spec.Status == RunSpecStatusCancelled
 }
 
 // IsDone returns true if the Run's status indicates that it is done.

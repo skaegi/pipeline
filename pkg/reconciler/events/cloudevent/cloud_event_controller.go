@@ -94,7 +94,7 @@ func SendCloudEvents(tr *v1beta1.TaskRun, ceclient CEClient, logger *zap.Sugared
 		}
 
 		// Send the event.
-		result := ceclient.Send(cloudevents.ContextWithTarget(context.Background(), cloudEventDelivery.Target), *event)
+		result := ceclient.Send(cloudevents.ContextWithTarget(cloudevents.ContextWithRetriesExponentialBackoff(context.Background(), 10*time.Millisecond, 10), cloudEventDelivery.Target), *event)
 
 		// Record the result.
 		eventStatus.SentAt = &metav1.Time{Time: time.Now()}
@@ -140,6 +140,7 @@ func SendCloudEventWithRetries(ctx context.Context, object runtime.Object) error
 	wasIn := make(chan error)
 	go func() {
 		wasIn <- nil
+		logger.Debugf("Sending cloudevent of type %q", event.Type())
 		if result := ceClient.Send(cloudevents.ContextWithRetriesExponentialBackoff(ctx, 10*time.Millisecond, 10), *event); !cloudevents.IsACK(result) {
 			logger.Warnf("Failed to send cloudevent: %s", result.Error())
 			recorder := controller.GetEventRecorder(ctx)

@@ -21,7 +21,7 @@ is a constant balancing act, and we want to be careful and deliberate with what 
 include.
 
 Features we don't have or aren't yet 100% satisfied with for "feature complete"
-Tekton:
+Tekton (also discoverable via [the area/roadmap label](https://github.com/tektoncd/pipeline/labels/area%2Froadmap)):
 
 - [Failure strategies](https://github.com/tektoncd/pipeline/issues/1684)
 - [Conditional execution](https://github.com/tektoncd/pipeline/blob/master/docs/conditions.md)
@@ -34,7 +34,7 @@ Tekton:
 - [Alternative Task Implementations](https://github.com/tektoncd/pipeline/issues/215)
 - [Local Execution](https://github.com/tektoncd/pipeline/issues/235)
 - [Testing](https://github.com/tektoncd/pipeline/issues/1289) and [debugging](https://github.com/tektoncd/pipeline/issues/2069) frameworks
-- [Emiting events throughout `Pipeline`
+- [Emitting events throughout `Pipeline`
   execution](https://github.com/tektoncd/pipeline/issues/2082)
 - [Config as code](https://github.com/tektoncd/pipeline/issues/859) - This has some cross
   over with [a related Triggers issue](https://github.com/tektoncd/triggers/issues/189)
@@ -43,14 +43,15 @@ Tekton:
 - [Adding support for other architectures](https://github.com/tektoncd/pipeline/issues/856)
 - [Rich type support for params](https://github.com/tektoncd/pipeline/issues/1393)
 - Looping syntax (in [Tasks](https://github.com/tektoncd/pipeline/issues/2112) and/or [Pipelines](https://github.com/tektoncd/pipeline/issues/2050))- either implement or decide it is outside of scope (i.e. better suited for a DSL)
-- [Supplying credentials for authenticated actions in Tasks](https://github.com/tetkoncd/pipeline/issues/2343) - documented guidelines
+- [Supplying credentials for authenticated actions in Tasks](https://github.com/tektoncd/pipeline/issues/2343) - documented guidelines
   and implemented support for best practices when working with credentials.
+- [Provide a pipeline concurrency limit](https://github.com/tektoncd/pipeline/issues/1305)
 
 ## Beta for all components
 
 In early 2020 we will have our first beta release, however
 [it will be only for a subset of Pipeline's resources](https://docs.google.com/document/d/1H8I2Rk4kLdQaR4mV0A71Qbk-1FxXFrmvisEAjLKT6H0/edit#heading=h.t0sc4hdrr5yq).
-After the intial beta release, we would like to get the rest of the resources to beta
+After the initial beta release, we would like to get the rest of the resources to beta
 as well.
 
 ## Task Interfaces and PipelineResources
@@ -76,7 +77,7 @@ https://github.com/tektoncd/pipeline/tree/master/cmd.
 
 SCM support in 2019 was handled by
 [the PullRequest Resource](https://github.com/tektoncd/pipeline/blob/master/docs/resources.md#pull-request-resource).
-However [we are revisting PipelineResources](#task-interfaces-and-pipelineresources),
+However [we are revisiting PipelineResources](#task-interfaces-and-pipelineresources),
 and likely this `PipelineResource` will become one or more `Tasks` in
 [the catalog](https://github.com/tektoncd/catalog) instead. Once that happens,
 we will need to make decisions about how to release and maintain the

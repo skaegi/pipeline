@@ -51,10 +51,20 @@ retrieving those events using the `kubectl describe` command. Tekton can also em
 When you [configure a sink](install.md#configuring-cloudevents-notifications), Tekton emits
 events as described in the table below.
 
-Resource  |Event    |Event Type
-:---------|:-------:|:----------------------------------------------------------
-`TaskRun` | `Started` | `dev.tekton.event.taskrun.started.v1`
-`TaskRun` | `Running` | `dev.tekton.event.taskrun.runnning.v1`
-`TaskRun` | `Condition Change while Running` | `dev.tekton.event.taskrun.unknown.v1`
-`TaskRun` | `Succeed` | `dev.tekton.event.taskrun.successful.v1`
-`TaskRun` | `Failed` | `dev.tekton.event.taskrun.failed.v1`
+Tekton sends cloud events in a parallel routine to allow for retries without blocking the
+reconciler. A routine is started every time the `Succeeded` condition changes - either state,
+reason or message. Retries are sent using an exponential back-off strategy. 
+Because of retries, events are not guaranteed to be sent to the target sink in the order they happened.
+
+Resource      |Event    |Event Type
+:-------------|:-------:|:----------------------------------------------------------
+`TaskRun`     | `Started` | `dev.tekton.event.taskrun.started.v1`
+`TaskRun`     | `Running` | `dev.tekton.event.taskrun.running.v1`
+`TaskRun`     | `Condition Change while Running` | `dev.tekton.event.taskrun.unknown.v1`
+`TaskRun`     | `Succeed` | `dev.tekton.event.taskrun.successful.v1`
+`TaskRun`     | `Failed`  | `dev.tekton.event.taskrun.failed.v1`
+`PipelineRun` | `Started` | `dev.tekton.event.pipelinerun.started.v1`
+`PipelineRun` | `Running` | `dev.tekton.event.pipelinerun.running.v1`
+`PipelineRun` | `Condition Change while Running` | `dev.tekton.event.pipelinerun.unknown.v1`
+`PipelineRun` | `Succeed` | `dev.tekton.event.pipelinerun.successful.v1`
+`PipelineRun` | `Failed`  | `dev.tekton.event.pipelinerun.failed.v1`

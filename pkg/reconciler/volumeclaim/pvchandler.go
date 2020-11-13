@@ -17,9 +17,11 @@ limitations under the License.
 package volumeclaim
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 
-	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1alpha1"
+	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,7 +37,7 @@ const (
 )
 
 type PvcHandler interface {
-	CreatePersistentVolumeClaimsForWorkspaces(wb []v1alpha1.WorkspaceBinding, ownerReference metav1.OwnerReference, namespace string) error
+	CreatePersistentVolumeClaimsForWorkspaces(ctx context.Context, wb []v1beta1.WorkspaceBinding, ownerReference metav1.OwnerReference, namespace string) error
 }
 
 type defaultPVCHandler struct {
@@ -51,13 +53,13 @@ func NewPVCHandler(clientset clientset.Interface, logger *zap.SugaredLogger) Pvc
 // where claim-name is provided by the user in the volumeClaimTemplate, and owner-name is the name of the
 // resource with the volumeClaimTemplate declared, a PipelineRun or TaskRun. If the PVC did not exist, a new PVC
 // with that name is created with the provided OwnerReference.
-func (c *defaultPVCHandler) CreatePersistentVolumeClaimsForWorkspaces(wb []v1alpha1.WorkspaceBinding, ownerReference metav1.OwnerReference, namespace string) error {
+func (c *defaultPVCHandler) CreatePersistentVolumeClaimsForWorkspaces(ctx context.Context, wb []v1beta1.WorkspaceBinding, ownerReference metav1.OwnerReference, namespace string) error {
 	var errs []error
 	for _, claim := range getPersistentVolumeClaims(wb, ownerReference, namespace) {
-		_, err := c.clientset.CoreV1().PersistentVolumeClaims(claim.Namespace).Get(claim.Name, metav1.GetOptions{})
+		_, err := c.clientset.CoreV1().PersistentVolumeClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
 		switch {
 		case apierrors.IsNotFound(err):
-			_, err := c.clientset.CoreV1().PersistentVolumeClaims(claim.Namespace).Create(claim)
+			_, err := c.clientset.CoreV1().PersistentVolumeClaims(claim.Namespace).Create(ctx, claim, metav1.CreateOptions{})
 			if err != nil {
 				errs = append(errs, fmt.Errorf("failed to create PVC %s: %s", claim.Name, err))
 			}
@@ -71,7 +73,7 @@ func (c *defaultPVCHandler) CreatePersistentVolumeClaimsForWorkspaces(wb []v1alp
 	return errorutils.NewAggregate(errs)
 }
 
-func getPersistentVolumeClaims(workspaceBindings []v1alpha1.WorkspaceBinding, ownerReference metav1.OwnerReference, namespace string) map[string]*corev1.PersistentVolumeClaim {
+func getPersistentVolumeClaims(workspaceBindings []v1beta1.WorkspaceBinding, ownerReference metav1.OwnerReference, namespace string) map[string]*corev1.PersistentVolumeClaim {
 	claims := make(map[string]*corev1.PersistentVolumeClaim)
 	for _, workspaceBinding := range workspaceBindings {
 		if workspaceBinding.VolumeClaimTemplate == nil {
@@ -88,10 +90,18 @@ func getPersistentVolumeClaims(workspaceBindings []v1alpha1.WorkspaceBinding, ow
 }
 
 // GetPersistentVolumeClaimName gets the name of PersistentVolumeClaim for a Workspace and PipelineRun or TaskRun. claim
-// must be a PersistentVolumeClaim from set's VolumeClaims template.
-func GetPersistentVolumeClaimName(claim *corev1.PersistentVolumeClaim, wb v1alpha1.WorkspaceBinding, owner metav1.OwnerReference) string {
+// must be a PersistentVolumeClaim from a volumeClaimTemplate. The returned name must be consistent given the same
+// workspaceBinding name and ownerReference name - because it is first used for creating a PVC and later,
+// possibly several TaskRuns to lookup the PVC to mount.
+func GetPersistentVolumeClaimName(claim *corev1.PersistentVolumeClaim, wb v1beta1.WorkspaceBinding, owner metav1.OwnerReference) string {
 	if claim.Name == "" {
-		return fmt.Sprintf("%s-%s", wb.Name, owner.Name)
+		return fmt.Sprintf("%s-%s", "pvc", getPersistentVolumeClaimIdentity(wb.Name, owner.Name))
 	}
-	return fmt.Sprintf("%s-%s-%s", claim.Name, wb.Name, owner.Name)
+	return fmt.Sprintf("%s-%s", claim.Name, getPersistentVolumeClaimIdentity(wb.Name, owner.Name))
+}
+
+func getPersistentVolumeClaimIdentity(workspaceName, ownerName string) string {
+	hashBytes := sha256.Sum256([]byte(workspaceName + ownerName))
+	hashString := fmt.Sprintf("%x", hashBytes)
+	return hashString[:10]
 }

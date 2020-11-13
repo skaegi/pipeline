@@ -24,6 +24,7 @@ import (
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	"github.com/tektoncd/pipeline/pkg/names"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -55,14 +56,23 @@ func convertScripts(shellImage string, steps []v1beta1.Step, sidecars []v1beta1.
 	placeScriptsInit := corev1.Container{
 		Name:         "place-scripts",
 		Image:        shellImage,
-		TTY:          true,
 		Command:      []string{"sh"},
 		Args:         []string{"-c", ""},
 		VolumeMounts: []corev1.VolumeMount{scriptsVolumeMount},
 	}
 
 	convertedStepContainers := convertListOfSteps(steps, &placeScriptsInit, &placeScripts, "script")
-	sidecarContainers := convertListOfSteps(sidecars, &placeScriptsInit, &placeScripts, "sidecar-script")
+
+	sideCarSteps := []v1beta1.Step{}
+	for _, step := range sidecars {
+		sidecarStep := v1beta1.Step{
+			Container: step.Container,
+			Script:    step.Script,
+			Timeout:   &metav1.Duration{},
+		}
+		sideCarSteps = append(sideCarSteps, sidecarStep)
+	}
+	sidecarContainers := convertListOfSteps(sideCarSteps, &placeScriptsInit, &placeScripts, "sidecar-script")
 
 	if placeScripts {
 		return &placeScriptsInit, convertedStepContainers, sidecarContainers
