@@ -54,6 +54,10 @@ spec:
       serviceAccountName: tekton-pipelines-controller
       containers:
       - name: tekton-pipelines-controller
+        command: [
+          "dlv", "--listen=:40000", "--headless=true", "--api-version=2",
+          "--accept-multiclient", "exec", "/ko-app/controller", "--"
+        ]
         image: ko://github.com/tektoncd/pipeline/cmd/controller
         args: [
           # Version, to be replace at release time
@@ -115,22 +119,6 @@ spec:
         ports:
         - name: probes
           containerPort: 8080
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: probes
-            scheme: HTTP
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          timeoutSeconds: 5
-        readinessProbe:
-          httpGet:
-            path: /readiness
-            port: probes
-            scheme: HTTP
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          timeoutSeconds: 5
       volumes:
         - name: config-logging
           configMap:

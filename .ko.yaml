@@ -1,4 +1,4 @@
-defaultBaseImage: gcr.io/distroless/static:nonroot
+defaultBaseImage: skaegi/ko-delve:1.5.0
 baseImageOverrides:
   # These base images run as root, which is needed for how they handle SSH credentials.
   # They are produced from ./images/Dockerfile
